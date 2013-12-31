@@ -1,0 +1,4507 @@
+From 8bca04c5ee5faddae9bdf42052738cba38823393 Mon Sep 17 00:00:00 2001
+From: Ravi K <rkerur@gmail.com>
+Date: Thu, 14 Jun 2012 16:42:24 -0700
+Subject: [PATCH 1/2] OF 1.1 and 1.3 MPLS changes.
+
+---
+ datapath/actions.c              |  425 +++++++++++++++++++++++++++++++++++++++
+ datapath/datapath.c             |   35 ++++
+ datapath/flow.c                 |   85 ++++++++-
+ datapath/flow.h                 |   25 +++
+ datapath/tunnel.c               |  234 ++++++++++++++++++++--
+ datapath/vport-gre.c            |   15 ++-
+ datapath/vport-internal_dev.c   |    9 +
+ datapath/vport-netdev.c         |  155 +++++++++++++--
+ datapath/vport.h                |    7 +
+ include/linux/openvswitch.h     |   17 ++
+ include/openflow/nicira-ext.h   |   90 ++++++++
+ include/openflow/openflow-1.2.h |    2 +
+ lib/classifier.c                |   55 +++++-
+ lib/classifier.h                |    3 +
+ lib/dpif-netdev.c               |   25 +++
+ lib/flow.c                      |  121 ++++++++++--
+ lib/flow.h                      |   24 ++-
+ lib/learn.c                     |    2 +-
+ lib/meta-flow.c                 |  116 +++++++++++
+ lib/meta-flow.h                 |    9 +
+ lib/nx-match.c                  |   23 ++-
+ lib/nx-match.h                  |    2 +-
+ lib/odp-util.c                  |  241 ++++++++++++++++++++++-
+ lib/odp-util.h                  |    6 +
+ lib/ofp-parse.c                 |   44 ++++
+ lib/ofp-print.c                 |   46 +++++
+ lib/ofp-util.c                  |   76 +++++++-
+ lib/ofp-util.def                |    8 +
+ lib/ofpbuf.c                    |    8 +-
+ lib/ofpbuf.h                    |    1 +
+ lib/packets.c                   |  352 ++++++++++++++++++++++++++++++++
+ lib/packets.h                   |   86 ++++++++
+ ofproto/ofproto-dpif.c          |   97 +++++++++
+ tests/automake.mk               |    6 +
+ tests/odp.at                    |   20 ++
+ tests/ofp-print.at              |    4 +-
+ tests/ofproto-dpif.at           |  140 ++++++++++---
+ tests/ofproto.at                |   10 +-
+ tests/test-mpls.c               |  288 ++++++++++++++++++++++++++
+ utilities/ovs-dpctl.c           |   30 +++-
+ utilities/ovs-ofctl.8.in        |   45 ++++
+ 41 files changed, 2880 insertions(+), 107 deletions(-)
+ create mode 100644 tests/test-mpls.c
+
+diff --git a/datapath/actions.c b/datapath/actions.c
+index 208f260..c02e007 100644
+--- a/datapath/actions.c
++++ b/datapath/actions.c
+@@ -123,6 +123,405 @@ static int push_vlan(struct sk_buff *skb, const struct ovs_action_push_vlan *vla
+ 	return 0;
+ }
+ 
++/* Get mpls tc from mpls label stack entry. */
++u8 mpls_lse_to_tc(__be32 mpls_lse)
++{
++	return (ntohl(mpls_lse) & MPLS_TC_MASK) >> MPLS_TC_SHIFT;
++}
++
++/* Get mpls ttl from mpls label stack entry. */
++u8 mpls_lse_to_ttl(__be32 mpls_lse)
++{
++	return (ntohl(mpls_lse) & MPLS_TTL_MASK) >> MPLS_TTL_SHIFT;
++}
++
++/* Determine where MPLS header starts
++ * assumes mac_header is already set. */
++static char *get_mpls_hdr(const struct sk_buff *skb)
++{
++	struct ethhdr *eth;
++	int nh_ofs;
++	__be16 dl_type = 0;
++
++	eth = eth_hdr(skb);
++	nh_ofs = sizeof(struct ethhdr);
++	if (likely(ntohs(eth->h_proto) >= ETH_TYPE_MIN))
++		dl_type = eth->h_proto;
++
++	/* Check for a VLAN tag. */
++	while (dl_type == htons(ETH_P_8021Q) &&
++			skb->len >= nh_ofs + sizeof(struct vlan_hdr)) {
++		struct vlan_hdr *vh = (struct vlan_hdr*)(skb->data + nh_ofs);
++		dl_type = vh->h_vlan_encapsulated_proto;
++		nh_ofs += sizeof(struct vlan_hdr);
++	}
++
++	return skb_mac_header(skb) + nh_ofs;
++}
++
++/* Determine where second MPLS header starts
++ * assumes mac_header is already set. */
++static char *get_next_mpls_hdr(const struct sk_buff *skb)
++{
++	struct ethhdr *eth;
++	int nh_ofs;
++	__be16 dl_type = 0;
++
++	eth = eth_hdr(skb);
++	nh_ofs = sizeof(struct ethhdr);
++	if (likely(ntohs(eth->h_proto) >= ETH_TYPE_MIN))
++		dl_type = eth->h_proto;
++
++	/* Check for a VLAN tag. */
++	while (dl_type == htons(ETH_P_8021Q) &&
++			skb->len >= nh_ofs + sizeof(struct vlan_hdr)) {
++		struct vlan_hdr *vh = (struct vlan_hdr*)(skb->data + nh_ofs);
++		dl_type = vh->h_vlan_encapsulated_proto;
++		nh_ofs += sizeof(struct vlan_hdr);
++	}
++
++	if ((dl_type == htons(ETH_P_MPLS_UC) ||
++		 dl_type == htons(ETH_P_MPLS_MC)) &&
++		 skb->len >= nh_ofs + sizeof(struct mpls_hdr)) {
++		nh_ofs += sizeof(struct mpls_hdr);
++	}
++
++	return skb_mac_header(skb) + nh_ofs;
++}
++
++/* Get ethertype from the header. */
++static __be16 get_ethertype(struct sk_buff *skb)
++{
++	struct ethhdr *eth = eth_hdr(skb);
++	__be16 eth_type = htons(0);
++	if (likely(ntohs(eth->h_proto) >= ETH_TYPE_MIN)) {
++		if (eth->h_proto == htons(ETH_P_8021Q)) {
++			eth_type = *(__be16 *)(get_mpls_hdr(skb) - 2);
++			return eth_type;
++		} else {
++			return eth->h_proto;
++		}
++	} else {
++		return eth_type;
++	}
++}
++
++/* Set ethertype in the header. */
++static void set_ethertype(struct sk_buff *skb, __be16 eth_type)
++{
++	struct ethhdr *eth = eth_hdr(skb);
++	if (likely(ntohs(eth->h_proto) >= ETH_TYPE_MIN)) {
++		if (eth->h_proto != htons(ETH_P_8021Q)) {
++			skb->protocol = eth->h_proto = eth_type;
++        } else {
++			/* 2 bytes before L2.5(MPLS) or L3 header is the
++			 * original ethertype.
++			 */
++			memcpy((void *)(get_mpls_hdr(skb) - 2), (void *)&eth_type, 2);
++		}
++	}
++}
++
++/* Set outermost MPLS ttl of the MPLS Label stack. */
++static void
++set_mpls_lse_ttl(__be32 *mpls_lse, __be32 ttl)
++{
++    *mpls_lse &= ~htonl(MPLS_TTL_MASK);
++    *mpls_lse |= ttl & htonl(MPLS_TTL_MASK);
++}
++
++/* Get mpls label from mpls label stack entry. */
++static u32 mpls_lse_to_label(__be32 mpls_lse)
++{
++	return (ntohl(mpls_lse) & MPLS_LABEL_MASK) >> MPLS_LABEL_SHIFT;
++}
++
++/* Set mpls lse values. */
++static void set_mpls_lse_values(__be32 *value, u8 ttl, u8 tos,
++								u32 label, u8 stack)
++{
++	*value =  htonl((stack << MPLS_STACK_SHIFT) |
++					(ttl << MPLS_TTL_SHIFT) |
++					(tos << MPLS_TC_SHIFT) |
++					(label << MPLS_LABEL_SHIFT));
++}
++
++/* Get ttl, tos and label associated with L3/L2.5. */
++static void get_label_ttl_and_tos(struct sk_buff *skb, __be16 eth_type,
++								  u8 *ttl, u8 *tos, u32 *label)
++{
++	__be32 mpls_lse = htonl(0);
++
++	switch (ntohs(eth_type)) {
++	case ETH_P_IP:
++		*ttl = ip_hdr(skb)->ttl;
++		*tos = (ipv4_get_dsfield(ip_hdr(skb)) >> 2) & 0x07;
++		*label = 0; /* IPV4 Explicit NULL label */
++	    break;
++
++	case ETH_P_IPV6:
++		*ttl = ipv6_hdr(skb)->hop_limit;
++		*tos = ipv6_get_dsfield(ipv6_hdr(skb)) & 0x07;
++		*label = 2; /* IPV6 Explicit NULL label */
++	    break;
++
++	case ETH_P_MPLS_UC:
++	case ETH_P_MPLS_MC:
++		mpls_lse = *((__be32 *)get_mpls_hdr(skb));
++		*ttl = mpls_lse_to_ttl(mpls_lse);
++		*tos = mpls_lse_to_tc(mpls_lse);
++		*label = mpls_lse_to_label(mpls_lse);
++	    break;
++
++	default:
++		*ttl = 64;
++		*tos = 0;
++		*label = 0;
++	    break;
++	}
++}
++
++/* Remove the top label in the MPLS label stack. */
++static void pop_mpls_lse(struct sk_buff *skb, struct mpls_hdr *mpls_h)
++{
++	u32 offset = (uintptr_t)get_mpls_hdr(skb) - (uintptr_t)skb->data;
++
++	/* Move everything up to L2.5 up 4 bytes. */
++	memmove((void *)skb->data + sizeof(struct mpls_hdr), skb->data, offset);
++
++	/* Pull offset + size. */
++	skb_pull(skb, sizeof(struct mpls_hdr));
++
++	/* Reset poniter to L2. */
++	skb_reset_mac_header(skb);
++}
++
++/* Add an MPLS label to the top off the label stack. */
++static int push_mpls_lse(struct sk_buff *skb, struct mpls_hdr *mpls_h)
++{
++	/* Bytes before L2.5. */
++	u32 offset = (uintptr_t)get_mpls_hdr(skb) - (uintptr_t)skb->data;
++
++	/* Make sure there's room. */
++	if (skb_cow_head(skb, MPLS_HLEN) < 0) {
++		kfree_skb(skb);
++		return 1;
++	}
++
++	/* Make room for new label by adding 4 bytes. */
++	skb_push(skb, MPLS_HLEN);
++
++	/* Reset pointer to L2. */
++	skb_reset_mac_header(skb);
++
++	/* Move L2 header + vlan(if any) to make room for new label. */
++	memmove((void *)skb->data, (void *)skb->data + MPLS_HLEN, offset);
++
++	*((__be32*)get_mpls_hdr(skb)) = mpls_h->mpls_lse;
++	return 0;
++}
++
++/* Pop MPLS header from a packet. */
++static int pop_mpls(struct sk_buff *skb,
++                    __be16 pop_ethertype)
++{
++	struct ethhdr *eth;
++	struct mpls_hdr mpls_h;
++	__be16 eth_proto;
++
++	eth_proto = get_ethertype(skb);
++
++	eth = eth_hdr(skb);
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++
++		/* Grab the MLPS label at the top of the stack. */
++		mpls_h.mpls_lse = *((__be32*)get_mpls_hdr(skb));
++		pop_mpls_lse(skb, &mpls_h);
++
++		if (mpls_h.mpls_lse & htonl(MPLS_STACK_MASK)) {
++			set_ethertype(skb, pop_ethertype);
++		}
++		/* Calculate csum since mpls label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++	}
++	return 0;
++}
++
++/* Push a new MPLS header onto packet. */
++static int push_mpls(struct sk_buff *skb,
++                     __be16 push_ethertype)
++{
++	struct mpls_hdr mpls_h;
++	__be16 eth_proto;
++	u32 label;
++	u8 ttl, tos;
++
++	eth_proto = get_ethertype(skb);
++
++	get_label_ttl_and_tos(skb, eth_proto, &ttl, &tos, &label);
++
++	/* First check whether there is another label on the stack. */
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++		set_mpls_lse_values(&mpls_h.mpls_lse, ttl, tos, label, 0);
++	} else {
++		/* IPV4/IPv6, VLAN, QinQ or could be vpls. */
++		set_mpls_lse_values(&mpls_h.mpls_lse, ttl, tos, label, 1);
++	}
++
++	/* push the new label. */
++	if (!push_mpls_lse(skb, &mpls_h)) {
++		/* Also change the Ethertype to MPLS. */
++		set_ethertype(skb, push_ethertype);
++		/* Calculate csum since mpls label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++		return 0;
++	}
++	return 1;
++}
++
++/* Change MPLS label stack entry. */
++static int set_mpls_lse(struct sk_buff *skb, __be32 mpls_lse)
++{
++	__be16 eth_proto;
++	eth_proto = get_ethertype(skb);
++
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++
++		*((__be32 *)get_mpls_hdr(skb)) = mpls_lse;
++		/* Update checksum since mple label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++	}
++
++	return 0;
++}
++
++/* Decrement MPLS TTL in the packet. */
++static int dec_mpls_ttl(struct sk_buff *skb)
++{
++	struct mpls_hdr mpls_h;
++	__be16 eth_proto;
++	u8 ttl;
++
++	eth_proto = get_ethertype(skb);
++
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++		mpls_h.mpls_lse = *((__be32 *)get_mpls_hdr(skb));
++		if (mpls_h.mpls_lse & htonl(MPLS_TTL_MASK)) {
++			ttl = mpls_lse_to_ttl(mpls_h.mpls_lse) - 1;
++			set_mpls_lse_ttl(&mpls_h.mpls_lse, htonl(ttl));
++			*((__be32 *)get_mpls_hdr(skb)) = mpls_h.mpls_lse;
++
++		}
++		/* Calculate csum since mpls label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++	}
++	return 0;
++}
++
++/* Helper function to copy MPLS TTL inwards. */
++static void copy_ttl_in(struct sk_buff *skb, u8 new_ttl)
++{
++	struct mpls_hdr mpls_nh;
++	mpls_nh.mpls_lse = *((__be32 *)get_next_mpls_hdr(skb));
++	set_mpls_lse_ttl(&mpls_nh.mpls_lse, htonl(new_ttl));
++	*((__be32 *)get_next_mpls_hdr(skb)) = mpls_nh.mpls_lse;
++}
++
++/* Copy MPLS TTL into IP/MPLS TTL. */
++static int copy_mpls_ttl_in(struct sk_buff *skb)
++{
++	struct mpls_hdr mpls_h;
++	__be16 eth_proto;
++
++	eth_proto = get_ethertype(skb);
++
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++		u8 new_ttl;
++		mpls_h.mpls_lse = *((__be32 *)get_mpls_hdr(skb));
++		new_ttl = mpls_lse_to_ttl(mpls_h.mpls_lse);
++		if (mpls_h.mpls_lse & htonl(MPLS_STACK_MASK)) {
++			if (ip_hdr(skb)->version == 4) {
++				csum_replace2(&ip_hdr(skb)->check, htons(ip_hdr(skb)->ttl << 8),
++							  htons(new_ttl << 8));
++				ip_hdr(skb)->ttl = new_ttl;
++			} else if (ipv6_hdr(skb)->version == 6) {
++				ipv6_hdr(skb)->hop_limit = new_ttl;
++			}
++		} else {
++			copy_ttl_in(skb, new_ttl);
++		}
++		/* Calculate csum since mpls label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++	}
++	return 0;
++}
++
++/* Helper function to copy MPLS TTL outwards. */
++static void copy_ttl_out(struct sk_buff *skb, struct mpls_hdr mpls_h)
++{
++	struct mpls_hdr mpls_nh;
++	u8 ttl;
++	mpls_nh.mpls_lse = *((__be32 *)get_next_mpls_hdr(skb));
++	ttl = mpls_lse_to_ttl(mpls_nh.mpls_lse);
++	set_mpls_lse_ttl(&mpls_h.mpls_lse, htonl(ttl));
++	*((__be32 *)get_mpls_hdr(skb)) = mpls_h.mpls_lse;
++}
++
++/* Copy IP/MPLS TTL into outer MPLS header. */
++static int copy_mpls_ttl_out(struct sk_buff *skb)
++{
++	struct mpls_hdr mpls_h;
++	__be16 eth_proto;
++	u8  ttl;
++
++	eth_proto = get_ethertype(skb);
++
++	if (eth_proto == htons(ETH_P_MPLS_UC) ||
++		eth_proto == htons(ETH_P_MPLS_MC)) {
++		mpls_h.mpls_lse = *((__be32 *)get_mpls_hdr(skb));
++		if (mpls_h.mpls_lse & htonl(MPLS_STACK_MASK)) {
++			if (ip_hdr(skb)->version == 4) {
++				ttl = ip_hdr(skb)->ttl;
++			} else if (ipv6_hdr(skb)->version == 6) {
++				ttl = ipv6_hdr(skb)->hop_limit;
++			} else {
++				ttl = 64;
++			}
++			set_mpls_lse_ttl(&mpls_h.mpls_lse, htonl(ttl));
++			*((__be32 *)get_mpls_hdr(skb)) = mpls_h.mpls_lse;
++		} else {
++			copy_ttl_out(skb, mpls_h);
++		}
++
++		/* Calculate csum since mpls label stack entry is modified. */
++		if (get_ip_summed(skb) == OVS_CSUM_COMPLETE) {
++			skb->csum = csum_sub(skb->csum,
++						csum_partial(skb->data + ETH_HLEN, MPLS_HLEN, 0));
++		}
++	}
++	return 0;
++}
++
+ static int set_eth_addr(struct sk_buff *skb,
+ 			const struct ovs_key_ethernet *eth_key)
+ {
+@@ -406,6 +805,32 @@ static int do_execute_actions(struct datapath *dp, struct sk_buff *skb,
+ 			err = pop_vlan(skb);
+ 			break;
+ 
++		case OVS_ACTION_ATTR_PUSH_MPLS:
++			err = push_mpls(skb, nla_get_be16(a));
++			if (unlikely(err)) /* skb already freed. */
++				return err;
++			break;
++
++		case OVS_ACTION_ATTR_POP_MPLS:
++			err = pop_mpls(skb, nla_get_be16(a));
++			break;
++
++		case OVS_ACTION_ATTR_SET_MPLS_LSE:
++			err = set_mpls_lse(skb, nla_get_be32(a));
++			break;
++
++		case OVS_ACTION_ATTR_DEC_MPLS_TTL:
++			err = dec_mpls_ttl(skb);
++			break;
++
++		case OVS_ACTION_ATTR_COPY_TTL_IN:
++			err = copy_mpls_ttl_in(skb);
++			break;
++
++		case OVS_ACTION_ATTR_COPY_TTL_OUT:
++			err = copy_mpls_ttl_out(skb);
++			break;
++
+ 		case OVS_ACTION_ATTR_SET:
+ 			err = execute_set_action(skb, nla_data(a));
+ 			break;
+diff --git a/datapath/datapath.c b/datapath/datapath.c
+index c2cb6b1..2126e2c 100644
+--- a/datapath/datapath.c
++++ b/datapath/datapath.c
+@@ -664,10 +664,19 @@ static int validate_actions(const struct nlattr *attr,
+ 			[OVS_ACTION_ATTR_USERSPACE] = (u32)-1,
+ 			[OVS_ACTION_ATTR_PUSH_VLAN] = sizeof(struct ovs_action_push_vlan),
+ 			[OVS_ACTION_ATTR_POP_VLAN] = 0,
++			[OVS_ACTION_ATTR_PUSH_MPLS] = sizeof(__be16),
++			[OVS_ACTION_ATTR_POP_MPLS] = sizeof(__be16),
++			[OVS_ACTION_ATTR_SET_MPLS_LSE] = sizeof(__be32),
++			[OVS_ACTION_ATTR_DEC_MPLS_TTL] = 0,
++			[OVS_ACTION_ATTR_COPY_TTL_IN] = 0,
++			[OVS_ACTION_ATTR_COPY_TTL_OUT] = 0,
+ 			[OVS_ACTION_ATTR_SET] = (u32)-1,
+ 			[OVS_ACTION_ATTR_SAMPLE] = (u32)-1
+ 		};
+ 		const struct ovs_action_push_vlan *vlan;
++		__be16 push_ethertype;
++		__be16 pop_ethertype;
++		__be32 mpls_lse;
+ 		int type = nla_type(a);
+ 
+ 		if (type > OVS_ACTION_ATTR_MAX ||
+@@ -702,6 +711,32 @@ static int validate_actions(const struct nlattr *attr,
+ 				return -EINVAL;
+ 			break;
+ 
++		case OVS_ACTION_ATTR_PUSH_MPLS:
++			push_ethertype = nla_get_be16(a);
++			if (push_ethertype != htons(ETH_P_MPLS_UC) &&
++				push_ethertype != htons(ETH_P_MPLS_MC))
++				return -EINVAL;
++			break;
++
++		case OVS_ACTION_ATTR_POP_MPLS:
++			pop_ethertype = nla_get_be16(a);
++			if (pop_ethertype == htons(ETH_P_MPLS_UC) ||
++				pop_ethertype == htons(ETH_P_MPLS_MC))
++				return -EINVAL;
++			break;
++
++		case OVS_ACTION_ATTR_SET_MPLS_LSE:
++			mpls_lse = nla_get_be32(a);
++			if (mpls_lse == htonl(0)) {
++				return -EINVAL;
++			}
++			break;
++
++		case OVS_ACTION_ATTR_DEC_MPLS_TTL:
++		case OVS_ACTION_ATTR_COPY_TTL_IN:
++		case OVS_ACTION_ATTR_COPY_TTL_OUT:
++			break;
++
+ 		case OVS_ACTION_ATTR_SET:
+ 			err = validate_set(a, key);
+ 			if (err)
+diff --git a/datapath/flow.c b/datapath/flow.c
+index d07337c..d07753a 100644
+--- a/datapath/flow.c
++++ b/datapath/flow.c
+@@ -479,6 +479,55 @@ static int parse_vlan(struct sk_buff *skb, struct sw_flow_key *key)
+ 	return 0;
+ }
+ 
++static int parse_remaining_mpls(struct sk_buff *skb)
++{
++	struct mtag_prefix {
++		__be32 mpls_lse;
++	};
++	struct mtag_prefix *mp;
++
++	if (unlikely(skb->len < sizeof(struct mtag_prefix) + sizeof(__be16)))
++		return 0;
++
++	if (unlikely(!pskb_may_pull(skb, MPLS_HLEN + sizeof(__be16))))
++		return -ENOMEM;
++
++	mp = (struct mtag_prefix *) skb->data;
++
++	while (!(mp->mpls_lse & htonl(MPLS_STACK_MASK))) {
++		__skb_pull(skb, sizeof(struct mtag_prefix));
++
++		if (unlikely(!pskb_may_pull(skb, MPLS_HLEN + sizeof(__be16))))
++			return -ENOMEM;
++
++		mp = (struct mtag_prefix *) skb->data;
++	}
++	__skb_pull(skb, sizeof(struct mtag_prefix));
++
++	return 0;
++}
++
++static int parse_mpls(struct sk_buff *skb, struct sw_flow_key *key)
++{
++	struct mtag_prefix {
++		__be32 mpls_lse;
++	};
++	struct mtag_prefix *mp;
++
++	if (unlikely(skb->len < sizeof(struct mtag_prefix) + sizeof(__be16)))
++		return 0;
++
++	if (unlikely(!pskb_may_pull(skb, sizeof(struct mtag_prefix) +
++									sizeof(__be16))))
++		return -ENOMEM;
++
++	mp = (struct mtag_prefix *) skb->data;
++	key->mpls.mpls_lse = mp->mpls_lse;
++	__skb_pull(skb, sizeof(struct mtag_prefix));
++
++	return 0;
++}
++
+ static __be16 parse_ethertype(struct sk_buff *skb)
+ {
+ 	struct llc_snap_hdr {
+@@ -612,7 +661,8 @@ out:
+  *    - skb->mac_header: the Ethernet header.
+  *
+  *    - skb->network_header: just past the Ethernet header, or just past the
+- *      VLAN header, to the first byte of the Ethernet payload.
++ *      VLAN header, or just past MPLS shim header to the first byte of the
++ *      Ethernet payload.
+  *
+  *    - skb->transport_header: If key->dl_type is ETH_P_IP or ETH_P_IPV6
+  *      on output, then just past the IP header, if one is present and
+@@ -653,6 +703,17 @@ int ovs_flow_extract(struct sk_buff *skb, u16 in_port, struct sw_flow_key *key,
+ 	if (unlikely(key->eth.type == htons(0)))
+ 		return -ENOMEM;
+ 
++	if (key->eth.type == htons(ETH_P_MPLS_UC) ||
++	    key->eth.type == htons(ETH_P_MPLS_MC)) {
++		if (unlikely(parse_mpls(skb, key)))
++			return -ENOMEM;
++		key_len = SW_FLOW_KEY_OFFSET(mpls.mpls_lse);
++		if (!(key->mpls.mpls_lse & htonl(MPLS_STACK_MASK))) {
++			if (unlikely(parse_remaining_mpls(skb)))
++				return -ENOMEM;
++		}
++	}
++
+ 	skb_reset_network_header(skb);
+ 	__skb_push(skb, skb->data - skb_mac_header(skb));
+ 
+@@ -844,6 +905,7 @@ const int ovs_key_lens[OVS_KEY_ATTR_MAX + 1] = {
+ 	[OVS_KEY_ATTR_ICMPV6] = sizeof(struct ovs_key_icmpv6),
+ 	[OVS_KEY_ATTR_ARP] = sizeof(struct ovs_key_arp),
+ 	[OVS_KEY_ATTR_ND] = sizeof(struct ovs_key_nd),
++	[OVS_KEY_ATTR_MPLS] = sizeof(__be32),
+ 
+ 	/* Not upstream. */
+ 	[OVS_KEY_ATTR_TUN_ID] = sizeof(__be64),
+@@ -1076,6 +1138,20 @@ int ovs_flow_from_nlattrs(struct sw_flow_key *swkey, int *key_lenp,
+ 		swkey->eth.type = htons(ETH_P_802_2);
+ 	}
+ 
++	if (swkey->eth.type == htons(ETH_P_MPLS_UC) ||
++	    swkey->eth.type == htons(ETH_P_MPLS_MC)) {
++		__be32 mpls_lse;
++
++		if (!(attrs & (1 << OVS_KEY_ATTR_MPLS))) {
++			return -EINVAL;
++		}
++		mpls_lse = nla_get_be32(a[OVS_KEY_ATTR_MPLS]);
++		swkey->mpls.mpls_lse = mpls_lse;
++		attrs &= ~(1 << OVS_KEY_ATTR_MPLS);
++
++		key_len = SW_FLOW_KEY_OFFSET(mpls.mpls_lse);
++	}
++
+ 	if (swkey->eth.type == htons(ETH_P_IP)) {
+ 		const struct ovs_key_ipv4 *ipv4_key;
+ 
+@@ -1242,6 +1318,13 @@ int ovs_flow_to_nlattrs(const struct sw_flow_key *swkey, struct sk_buff *skb)
+ 	if (nla_put_be16(skb, OVS_KEY_ATTR_ETHERTYPE, swkey->eth.type))
+ 		goto nla_put_failure;
+ 
++	if (swkey->eth.type == htons(ETH_P_MPLS_UC) ||
++		swkey->eth.type == htons(ETH_P_MPLS_MC)) {
++		if (nla_put_be32(skb, OVS_KEY_ATTR_MPLS, swkey->mpls.mpls_lse)) {
++			goto nla_put_failure;
++		}
++	}
++
+ 	if (swkey->eth.type == htons(ETH_P_IP)) {
+ 		struct ovs_key_ipv4 *ipv4_key;
+ 
+diff --git a/datapath/flow.h b/datapath/flow.h
+index 5be481e..aac8b4d 100644
+--- a/datapath/flow.h
++++ b/datapath/flow.h
+@@ -53,6 +53,9 @@ struct sw_flow_key {
+ 		__be16 type;		/* Ethernet frame type. */
+ 	} eth;
+ 	struct {
++		__be32 mpls_lse;	/* 0 if no MPLS, otherwise MPLS label Stack entry. */
++	} mpls;
++	struct {
+ 		u8     proto;		/* IP protocol or lower 8 bits of ARP opcode. */
+ 		u8     tos;		/* IP ToS. */
+ 		u8     ttl;		/* IP TTL/hop limit. */
+@@ -126,6 +129,28 @@ struct arp_eth_header {
+ 	unsigned char       ar_tip[4];		/* target IP address        */
+ } __packed;
+ 
++/* Minimum value for an Ethernet type.  Values below this are IEEE 802.2 frame
++ * lengths. */
++#define ETH_TYPE_MIN           0x600
++
++/* MPLS related definitions */
++#define MPLS_HLEN           4
++#define MPLS_TTL_MASK       0x000000ff
++#define MPLS_TTL_SHIFT      0
++
++#define MPLS_STACK_MASK     0x00000100
++#define MPLS_STACK_SHIFT    8
++
++#define MPLS_TC_MASK        0x00000e00
++#define MPLS_TC_SHIFT       9
++
++#define MPLS_LABEL_MASK     0xfffff000
++#define MPLS_LABEL_SHIFT    12
++
++struct mpls_hdr {
++	__be32 mpls_lse;
++} __packed;
++
+ int ovs_flow_init(void);
+ void ovs_flow_exit(void);
+ 
+diff --git a/datapath/tunnel.c b/datapath/tunnel.c
+index d651c11..bbce412 100644
+--- a/datapath/tunnel.c
++++ b/datapath/tunnel.c
+@@ -367,22 +367,99 @@ struct vport *ovs_tnl_find_port(struct net *net, __be32 saddr, __be32 daddr,
+ 	return NULL;
+ }
+ 
++/* Check MPLS encapsulated packets. */
++static bool check_skb_mpls(struct sk_buff *skb, __be32 *mpls_entry)
++{
++	__be32 mpls_lse = htonl(0);
++	unsigned int mpls_lse_len = MPLS_HLEN;
++
++	/* Handle VLAN/MPLS encapsulated packets. */
++	if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++		skb->protocol == htons(ETH_P_MPLS_MC)) {
++		if (unlikely(!pskb_may_pull(skb, MPLS_HLEN))) {
++			return false;
++		}
++
++		*mpls_entry = mpls_lse = *(__be32 *)(skb->data + ETH_HLEN);
++
++		while (!(mpls_lse & htonl(MPLS_STACK_MASK))) {
++			if (unlikely(!pskb_may_pull(skb, mpls_lse_len))) {
++				return false;
++			}
++			mpls_lse = *(__be32 *)(skb->data + ETH_HLEN + mpls_lse_len);
++			mpls_lse_len += MPLS_HLEN;
++		}
++		skb_set_network_header(skb, skb_network_offset(skb) + mpls_lse_len);
++	}
++	return true;
++}
++
++/* Check VLAN/MPLS packets. */
++static bool check_skb_vlan_mpls(struct sk_buff *skb, __be32 *mpls_entry)
++{
++	__be32 mpls_lse = htonl(0);
++	unsigned int mpls_lse_len = MPLS_HLEN;
++
++	/* Handle VLAN/MPLS encapsulated packets. */
++	if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++		skb->protocol == htons(ETH_P_MPLS_MC)) {
++		if (unlikely(!pskb_may_pull(skb, MPLS_HLEN))) {
++			return false;
++		}
++
++		*mpls_entry = mpls_lse = *(__be32 *)(skb->data + VLAN_ETH_HLEN);
++
++		while (!(mpls_lse & htonl(MPLS_STACK_MASK))) {
++			if (unlikely(!pskb_may_pull(skb, mpls_lse_len))) {
++				return false;
++			}
++			mpls_lse = *(__be32 *)(skb->data + VLAN_ETH_HLEN + mpls_lse_len);
++			mpls_lse_len += MPLS_HLEN;
++		}
++		skb_set_network_header(skb, skb_network_offset(skb) + mpls_lse_len);
++	}
++	return true;
++}
++
+ static void ecn_decapsulate(struct sk_buff *skb, u8 tos)
+ {
+ 	if (unlikely(INET_ECN_is_ce(tos))) {
++		__be32 mpls_lse = htonl(0);
+ 		__be16 protocol = skb->protocol;
+ 
+ 		skb_set_network_header(skb, ETH_HLEN);
+ 
+-		if (protocol == htons(ETH_P_8021Q)) {
++		if (skb->protocol == htons(ETH_P_8021Q)) {
+ 			if (unlikely(!pskb_may_pull(skb, VLAN_ETH_HLEN)))
+ 				return;
+ 
+-			protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
++			skb->protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+ 			skb_set_network_header(skb, VLAN_ETH_HLEN);
++
++			/* Handle VLAN/MPLS encapsulated packets. */
++			if (!check_skb_vlan_mpls(skb, &mpls_lse))
++				return;
++		} else {
++			if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
++				return;
++
++			/* Handle MPLS encapsulated packets. */
++			if (!check_skb_mpls(skb, &mpls_lse))
++				return;
+ 		}
+ 
+-		if (protocol == htons(ETH_P_IP)) {
++		/* If MPLS is present, get l3 information and update
++		 * ECN bits in inner header. */
++		if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++			skb->protocol == htons(ETH_P_MPLS_MC)) {
++			if (ip_hdr(skb)->version == 4) {
++				skb->protocol = htons(ETH_P_IP);
++			} else if (ipv6_hdr(skb)->version == 6) {
++				skb->protocol = htons(ETH_P_IPV6);
++			}
++		}
++
++		if (skb->protocol == htons(ETH_P_IP)) {
+ 			if (unlikely(!pskb_may_pull(skb, skb_network_offset(skb)
+ 			    + sizeof(struct iphdr))))
+ 				return;
+@@ -390,7 +467,7 @@ static void ecn_decapsulate(struct sk_buff *skb, u8 tos)
+ 			IP_ECN_set_ce(ip_hdr(skb));
+ 		}
+ #if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+-		else if (protocol == htons(ETH_P_IPV6)) {
++		else if (skb->protocol == htons(ETH_P_IPV6)) {
+ 			if (unlikely(!pskb_may_pull(skb, skb_network_offset(skb)
+ 			    + sizeof(struct ipv6hdr))))
+ 				return;
+@@ -398,6 +475,8 @@ static void ecn_decapsulate(struct sk_buff *skb, u8 tos)
+ 			IP6_ECN_set_ce(ipv6_hdr(skb));
+ 		}
+ #endif
++		/* Restore protocol to its original value. */
++		skb->protocol = protocol;
+ 	}
+ }
+ 
+@@ -611,11 +690,77 @@ static void ipv6_build_icmp(struct sk_buff *skb, struct sk_buff *nskb,
+ }
+ #endif /* IPv6 */
+ 
++/* Check MPLS stacked packets. Do not modify skb. */
++void check_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen)
++{
++	unsigned int mpls_lse_len = MPLS_HLEN;
++	__be32 mpls_lse = htonl(0);
++
++	if (unlikely(!pskb_may_pull(skb, ETH_HLEN + mpls_lse_len))) {
++		return;
++	}
++
++	if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++		skb->protocol == htons(ETH_P_MPLS_MC)) {
++		*mpls_hlen += MPLS_HLEN;
++		mpls_lse = *(__be32 *)(skb->data + ETH_HLEN);
++		while (!(mpls_lse & htonl(MPLS_STACK_MASK))) {
++			if (unlikely(!pskb_may_pull(skb, mpls_lse_len))) {
++				return;
++			}
++			mpls_lse = *(__be32 *)(skb->data + ETH_HLEN + mpls_lse_len);
++			*mpls_hlen += MPLS_HLEN;
++			mpls_lse_len += MPLS_HLEN;
++		}
++	}
++}
++
++/* Check VLAN/MPLS packets. Do not modify skb. */
++void check_vlan_mpls_hlen(struct sk_buff *skb, unsigned int *vlan_hlen,
++						  unsigned int *mpls_hlen)
++{
++	__be16 protocol;
++	__be32 mpls_lse = htonl(0);
++	unsigned int mpls_lse_len = MPLS_HLEN;
++	unsigned int total_hlen = ETH_HLEN;
++
++	protocol = eth_hdr(skb)->h_proto;
++	if (vlan_tx_tag_present(skb)) {
++		*vlan_hlen += VLAN_HLEN;
++	}
++
++	while (protocol == htons(ETH_P_8021Q)) {
++		struct vlan_hdr *vh;
++
++		if (unlikely(!pskb_may_pull(skb, total_hlen + VLAN_HLEN)))
++			return;
++
++		vh = (struct vlan_hdr *)(skb->data + total_hlen);
++		protocol = vh->h_vlan_encapsulated_proto;
++
++		*vlan_hlen += VLAN_HLEN;
++		total_hlen += VLAN_HLEN;
++	}
++
++	if (protocol == htons(ETH_P_MPLS_UC) ||
++		protocol == htons(ETH_P_MPLS_MC)) {
++		*mpls_hlen += MPLS_HLEN;
++		mpls_lse = *(__be32 *)(skb->data + total_hlen);
++		while (!(mpls_lse & htonl(MPLS_STACK_MASK))) {
++			if (unlikely(!pskb_may_pull(skb, total_hlen + mpls_lse_len)))
++				return;
++			mpls_lse = *(__be32 *)(skb->data + total_hlen + mpls_lse_len);
++			*mpls_hlen += MPLS_HLEN;
++			mpls_lse_len += MPLS_HLEN;
++		}
++	}
++}
++
+ bool ovs_tnl_frag_needed(struct vport *vport,
+ 			 const struct tnl_mutable_config *mutable,
+ 			 struct sk_buff *skb, unsigned int mtu, __be64 flow_key)
+ {
+-	unsigned int eth_hdr_len = ETH_HLEN;
++	unsigned int eth_hdr_len = ETH_HLEN, mpls_hdr_len = 0;
+ 	unsigned int total_length = 0, header_length = 0, payload_length;
+ 	struct ethhdr *eh, *old_eh = eth_hdr(skb);
+ 	struct sk_buff *nskb;
+@@ -648,10 +793,15 @@ bool ovs_tnl_frag_needed(struct vport *vport,
+ 		return false;
+ 
+ 	/* Allocate */
+-	if (old_eh->h_proto == htons(ETH_P_8021Q))
++	if (old_eh->h_proto == htons(ETH_P_8021Q)) {
++
+ 		eth_hdr_len = VLAN_ETH_HLEN;
++		check_vlan_mpls_hlen(skb, &eth_hdr_len, &mpls_hdr_len);
++	} else {
++		check_mpls_hlen(skb, &mpls_hdr_len);
++	}
+ 
+-	payload_length = skb->len - eth_hdr_len;
++	payload_length = skb->len - eth_hdr_len - mpls_hdr_len;
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+ 		header_length = sizeof(struct iphdr) + sizeof(struct icmphdr);
+ 		total_length = min_t(unsigned int, header_length +
+@@ -728,26 +878,40 @@ static bool check_mtu(struct sk_buff *skb,
+ 	__be16 frag_off = mutable->flags & TNL_F_DF_DEFAULT ? htons(IP_DF) : 0;
+ 	int mtu = 0;
+ 	unsigned int packet_length = skb->len - ETH_HLEN;
++	unsigned int vlan_hlen = 0, mpls_hlen = 0;
+ 
+-	/* Allow for one level of tagging in the packet length. */
++	/* Allow for one level of tagging and allow mpls headers
++	 * in the packet length. */
+ 	if (!vlan_tx_tag_present(skb) &&
+-	    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q))
++	    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q)) {
++
+ 		packet_length -= VLAN_HLEN;
++		check_vlan_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
++		packet_length = packet_length - mpls_hlen;
++	} else {
++		check_mpls_hlen(skb, &mpls_hlen);
++		packet_length -= mpls_hlen;
++	}
+ 
+ 	if (pmtud) {
+-		int vlan_header = 0;
++		unsigned int vlan_header = 0, mpls_header = 0;
+ 
+ 		/* The tag needs to go in packet regardless of where it
+ 		 * currently is, so subtract it from the MTU.
+ 		 */
+ 		if (vlan_tx_tag_present(skb) ||
+-		    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q))
++		    eth_hdr(skb)->h_proto == htons(ETH_P_8021Q)) {
+ 			vlan_header = VLAN_HLEN;
++			check_vlan_mpls_hlen(skb, &vlan_header, &mpls_header);
++		} else {
++			check_mpls_hlen(skb, &mpls_header);
++		}
+ 
+ 		mtu = dst_mtu(&rt_dst(rt))
+ 			- ETH_HLEN
+ 			- mutable->tunnel_hlen
+-			- vlan_header;
++			- vlan_header
++			- mpls_header;
+ 	}
+ 
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+@@ -1080,10 +1244,13 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb,
+ {
+ 	int min_headroom;
+ 	int err;
++	unsigned int vlan_hlen = 0, mpls_hlen = 0;
+ 
++	check_vlan_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
+ 	min_headroom = LL_RESERVED_SPACE(rt_dst(rt).dev) + rt_dst(rt).header_len
+ 			+ mutable->tunnel_hlen
+-			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0);
++			+ (vlan_tx_tag_present(skb) ? VLAN_HLEN : 0)
++			+ mpls_hlen;
+ 
+ 	if (skb_headroom(skb) < min_headroom || skb_header_cloned(skb)) {
+ 		int head_delta = SKB_DATA_ALIGN(min_headroom -
+@@ -1100,7 +1267,19 @@ static struct sk_buff *handle_offloads(struct sk_buff *skb,
+ 	if (skb_is_gso(skb)) {
+ 		struct sk_buff *nskb;
+ 
+-		nskb = skb_gso_segment(skb, 0);
++		if (mpls_tag_present(skb)) {
++			/* skb_gso_segment depends on skb->protocol, save and
++			 * restore after the call. */
++			__be16 tmp_protocol = skb->protocol;
++
++			/* Handle MPLS encapsulated packets. */
++			check_skb_vlan_mpls_protocol(skb);
++            nskb = skb_gso_segment(skb, 0);
++            skb->protocol = tmp_protocol;
++		} else {
++			nskb = skb_gso_segment(skb, 0);
++		}
++
+ 		if (IS_ERR(nskb)) {
+ 			kfree_skb(skb);
+ 			err = PTR_ERR(nskb);
+@@ -1180,6 +1359,7 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 	struct tnl_cache *cache;
+ 	int sent_len = 0;
+ 	__be16 frag_off = 0;
++	__be32 mpls_lse = htonl(0);
+ 	u8 ttl;
+ 	u8 inner_tos;
+ 	u8 tos;
+@@ -1192,6 +1372,18 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 
+ 		skb->protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
+ 		skb_set_network_header(skb, VLAN_ETH_HLEN);
++
++		/* Handle VLAN/MPLS encapsulated packets. */
++		if (!check_skb_vlan_mpls(skb, &mpls_lse))
++			goto error_free;
++	} else {
++		if (unlikely(!pskb_may_pull(skb, ETH_HLEN)))
++			goto error_free;
++
++		skb_set_network_header(skb, ETH_HLEN);
++		/* Handle MPLS encapsulated packets. */
++		if (!check_skb_mpls(skb, &mpls_lse))
++			goto error_free;
+ 	}
+ 
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+@@ -1206,6 +1398,11 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 			skb->protocol = 0;
+ 	}
+ #endif
++	else if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++			 skb->protocol == htons(ETH_P_MPLS_MC)) {
++		if (unlikely(!pskb_may_pull(skb, skb_network_offset(skb))))
++			skb->protocol = 0;
++	}
+ 
+ 	/* ToS */
+ 	if (skb->protocol == htons(ETH_P_IP))
+@@ -1214,7 +1411,10 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 	else if (skb->protocol == htons(ETH_P_IPV6))
+ 		inner_tos = ipv6_get_dsfield(ipv6_hdr(skb));
+ #endif
+-	else
++	else if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++			 skb->protocol == htons(ETH_P_MPLS_MC)) {
++		inner_tos = mpls_lse_to_tc(mpls_lse) << 2;
++	} else
+ 		inner_tos = 0;
+ 
+ 	if (mutable->flags & TNL_F_TOS_INHERIT)
+@@ -1271,6 +1471,10 @@ int ovs_tnl_send(struct vport *vport, struct sk_buff *skb)
+ 		else if (skb->protocol == htons(ETH_P_IPV6))
+ 			ttl = ipv6_hdr(skb)->hop_limit;
+ #endif
++		else if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++				 skb->protocol == htons(ETH_P_MPLS_MC)) {
++			ttl = mpls_lse_to_ttl(mpls_lse);
++		}
+ 	}
+ 
+ 	while (skb) {
+diff --git a/datapath/vport-gre.c b/datapath/vport-gre.c
+index ab89c5b..471f66b 100644
+--- a/datapath/vport-gre.c
++++ b/datapath/vport-gre.c
+@@ -101,6 +101,17 @@ static struct sk_buff *gre_update_header(const struct vport *vport,
+ 	__be32 *options = (__be32 *)(skb_network_header(skb) + mutable->tunnel_hlen
+ 					       - GRE_HEADER_SECTION);
+ 
++	/* GRE IP hdr doesn't carry options, hence ok to rely on iphdr size. */
++	struct gre_base_hdr *greh =
++		(struct gre_base_hdr *)(skb_network_header(skb) + sizeof(struct iphdr));
++
++	if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++		skb->protocol == htons(ETH_P_MPLS_MC)) {
++		/* For MPLS packets tunneled via GRE to MPLS adjacent router, set
++		 * protocol type to MPLS. */
++		greh->protocol = skb->protocol;
++	}
++
+ 	/* Work backwards over the options so the checksum is last. */
+ 	if (mutable->flags & TNL_F_OUT_KEY_ACTION)
+ 		*options = be64_get_low32(OVS_CB(skb)->tun_id);
+@@ -147,7 +158,9 @@ static int parse_header(struct iphdr *iph, __be16 *flags, __be64 *key)
+ 	if (unlikely(greh->flags & (GRE_VERSION | GRE_ROUTING)))
+ 		return -EINVAL;
+ 
+-	if (unlikely(greh->protocol != htons(ETH_P_TEB)))
++	if (unlikely(greh->protocol != htons(ETH_P_TEB) &&
++				 greh->protocol != htons(ETH_P_MPLS_UC) &&
++				 greh->protocol != htons(ETH_P_MPLS_MC)))
+ 		return -EINVAL;
+ 
+ 	hdr_len = GRE_HEADER_SECTION;
+diff --git a/datapath/vport-internal_dev.c b/datapath/vport-internal_dev.c
+index 4dc2eb4..595e23d 100644
+--- a/datapath/vport-internal_dev.c
++++ b/datapath/vport-internal_dev.c
+@@ -100,11 +100,20 @@ static int internal_dev_mac_addr(struct net_device *dev, void *p)
+ /* Called with rcu_read_lock_bh. */
+ static int internal_dev_xmit(struct sk_buff *skb, struct net_device *netdev)
+ {
++	struct ethhdr *eth;
+ 	if (unlikely(compute_ip_summed(skb, true))) {
+ 		kfree_skb(skb);
+ 		return 0;
+ 	}
+ 
++	/* Set skb->protocol since some sources don't */
++	skb_reset_mac_header(skb);
++        eth = eth_hdr(skb);
++        if (ntohs(eth->h_proto) >= 1536)
++		skb->protocol = eth->h_proto;
++	else
++		skb->protocol = htons(ETH_P_802_2);
++
+ 	vlan_copy_skb_tci(skb);
+ 	OVS_CB(skb)->flow = NULL;
+ 
+diff --git a/datapath/vport-netdev.c b/datapath/vport-netdev.c
+index 0098554..0848cbd 100644
+--- a/datapath/vport-netdev.c
++++ b/datapath/vport-netdev.c
+@@ -45,6 +45,21 @@ MODULE_PARM_DESC(vlan_tso, "Enable TSO for VLAN packets");
+ #define vlan_tso true
+ #endif
+ 
++/* Currently MPLS support is not available in kernel, so use the #define
++ * to control MPLS offload capability.
++ * mpls_tso = 0, use OVS offload simulation.
++ * mpls_tso = 1, use Linux kernel generic offload code. */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3,6,0)
++#include <linux/module.h>
++
++static int mpls_tso __read_mostly;
++module_param(mpls_tso, int, 0644);
++MODULE_PARM_DESC(mpls_tso, "Enable TSO for MPLS packets");
++#else
++#define mpls_tso true
++#endif
++
+ static void netdev_port_receive(struct vport *vport, struct sk_buff *skb);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
+@@ -273,12 +288,20 @@ static void netdev_port_receive(struct vport *vport, struct sk_buff *skb)
+ 	ovs_vport_receive(vport, skb);
+ }
+ 
+-static unsigned int packet_length(const struct sk_buff *skb)
++static unsigned int packet_length(struct sk_buff *skb)
+ {
+ 	unsigned int length = skb->len - ETH_HLEN;
++	unsigned int vlan_hlen = 0, mpls_hlen = 0;
++
++	if (skb->protocol == htons(ETH_P_8021Q)) {
+ 
+-	if (skb->protocol == htons(ETH_P_8021Q))
+ 		length -= VLAN_HLEN;
++		vlan_hlen = VLAN_HLEN;
++	}
++
++	/* Handle VLAN/MPLS or MPLS encapsulated packets. */
++	check_vlan_mpls_hlen(skb, &vlan_hlen, &mpls_hlen);
++	length = length - vlan_hlen - mpls_hlen;
+ 
+ 	return length;
+ }
+@@ -296,11 +319,75 @@ static bool dev_supports_vlan_tx(struct net_device *dev)
+ #endif
+ }
+ 
++/* Check for MPLS header presence. */
++bool mpls_tag_present(struct sk_buff *skb)
++{
++	if (!mpls_tso) {
++		__be16 protocol = htons(0);
++		if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++			skb->protocol == htons(ETH_P_MPLS_MC)) {
++			return true;
++		} else {
++
++			if (unlikely(!pskb_may_pull(skb, VLAN_ETH_HLEN + MPLS_HLEN)))
++				return false;
++
++			if (vlan_tx_tag_present(skb))
++				protocol = eth_hdr(skb)->h_proto;
++			else
++				protocol = vlan_eth_hdr(skb)->h_vlan_encapsulated_proto;
++
++			return (protocol == htons(ETH_P_MPLS_UC) ||
++					protocol == htons(ETH_P_MPLS_MC));
++		}
++	} else
++		return false;
++}
++
++/* Get protocol after MPLS or VLAN/MPLS header. */
++void check_skb_vlan_mpls_protocol(struct sk_buff *skb)
++{
++	int vlan_depth = ETH_HLEN;
++	int vlan_hlen = 0;
++
++	/* Handle MPLS, VLAN/MPLS and VLAN-QinQ/MPLS encapsulated packets. */
++	while (skb->protocol == htons(ETH_P_8021Q)) {
++		struct vlan_hdr *vh;
++
++		if (unlikely(!pskb_may_pull(skb, vlan_depth + VLAN_HLEN))) {
++			return;
++		}
++
++		if (vlan_tx_tag_present(skb)) {
++			skb->protocol = *(__be16*)(skb->data + 2 * ETH_ALEN + vlan_hlen);
++		} else {
++			vh = (struct vlan_hdr *)(skb->data + vlan_depth);
++			skb->protocol = vh->h_vlan_encapsulated_proto;
++		}
++		vlan_depth += VLAN_HLEN;
++		vlan_hlen += VLAN_HLEN;
++	}
++
++	if (skb->protocol == htons(ETH_P_MPLS_UC) ||
++		skb->protocol == htons(ETH_P_MPLS_MC)) {
++
++		if (unlikely(!pskb_may_pull(skb, vlan_depth + MPLS_HLEN + 4))) {
++			return;
++		}
++		if (ip_hdr(skb)->version == 4) {
++			skb->protocol = htons(ETH_P_IP);
++		} else if (ipv6_hdr(skb)->version == 6) {
++			skb->protocol = htons(ETH_P_IPV6);
++		}
++	}
++}
++
+ static int netdev_send(struct vport *vport, struct sk_buff *skb)
+ {
+ 	struct netdev_vport *netdev_vport = netdev_vport_priv(vport);
+ 	int mtu = netdev_vport->dev->mtu;
+ 	int len;
++	bool mpls_tag;
+ 
+ 	if (unlikely(packet_length(skb) > mtu && !skb_is_gso(skb))) {
+ 		net_warn_ratelimited("%s: dropped over-mtu packet: %d > %d\n",
+@@ -315,19 +402,36 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
+ 	skb->dev = netdev_vport->dev;
+ 	forward_ip_summed(skb, true);
+ 
+-	if (vlan_tx_tag_present(skb) && !dev_supports_vlan_tx(skb->dev)) {
++	mpls_tag = mpls_tag_present(skb);
++
++	/* Handle MPLS and VLAN packets(for kernel < 2.6.37). */
++	if (mpls_tag ||
++		(vlan_tx_tag_present(skb) && !dev_supports_vlan_tx(skb->dev))) {
+ 		int features;
+ 
+ 		features = netif_skb_features(skb);
+ 
+-		if (!vlan_tso)
++		if (vlan_tx_tag_present(skb) && !vlan_tso) {
++			features &= ~(NETIF_F_TSO | NETIF_F_TSO6 |
++						  NETIF_F_UFO | NETIF_F_FSO);
++		} else if (mpls_tag) {
+ 			features &= ~(NETIF_F_TSO | NETIF_F_TSO6 |
+-				      NETIF_F_UFO | NETIF_F_FSO);
++						  NETIF_F_UFO | NETIF_F_FSO | NETIF_F_ALL_CSUM);
++		}
+ 
+ 		if (netif_needs_gso(skb, features)) {
+ 			struct sk_buff *nskb;
+ 
+-			nskb = skb_gso_segment(skb, features);
++			if (mpls_tag) {
++				/* skb_gso_segment depends on skb->protocol, save and
++				 * restore after the call. */
++				__be16 tmp_protocol = skb->protocol;
++				check_skb_vlan_mpls_protocol(skb);
++				nskb = skb_gso_segment(skb, features);
++				skb->protocol = tmp_protocol;
++			} else {
++				nskb = skb_gso_segment(skb, features);
++			}
+ 			if (!nskb) {
+ 				if (unlikely(skb_cloned(skb) &&
+ 				    pskb_expand_head(skb, 0, 0, GFP_ATOMIC))) {
+@@ -351,24 +455,45 @@ static int netdev_send(struct vport *vport, struct sk_buff *skb)
+ 				nskb = skb->next;
+ 				skb->next = NULL;
+ 
+-				skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+-				if (likely(skb)) {
+-					len += skb->len;
+-					vlan_set_tci(skb, 0);
+-					dev_queue_xmit(skb);
++				/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets. */
++				if (vlan_tx_tag_present(skb)) {
++					skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
++					if (likely(skb)) {
++						len += skb->len;
++						vlan_set_tci(skb, 0);
++						dev_queue_xmit(skb);
++					}
++				} else {
++					/* MPLS packets. */
++					if (likely(skb)) {
++						len += skb->len;
++						dev_queue_xmit(skb);
++					}
+ 				}
+ 
+ 				skb = nskb;
+ 			} while (skb);
+ 
+ 			return len;
++		} else if (mpls_tag &&
++				   get_ip_summed(skb) == OVS_CSUM_PARTIAL) {
++			int err;
++			/* Linearize skb before calculating checksum. */
++			if (unlikely(skb_linearize(skb)))
++				goto error;
++			err = skb_checksum_help(skb);
++			if (unlikely(err))
++				goto error;
+ 		}
+ 
+ tag:
+-		skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
+-		if (unlikely(!skb))
+-			return 0;
+-		vlan_set_tci(skb, 0);
++		/* VLAN packets (kernel < 2.6.37) or VLAN/MPLS packets. */
++		if (vlan_tx_tag_present(skb)) {
++			skb = __vlan_put_tag(skb, vlan_tx_tag_get(skb));
++			if (unlikely(!skb))
++				return 0;
++			vlan_set_tci(skb, 0);
++		}
+ 	}
+ 
+ 	len = skb->len;
+diff --git a/datapath/vport.h b/datapath/vport.h
+index b0cdeae..019ce57 100644
+--- a/datapath/vport.h
++++ b/datapath/vport.h
+@@ -249,6 +249,13 @@ static inline struct vport *vport_from_priv(const void *priv)
+ 
+ void ovs_vport_receive(struct vport *, struct sk_buff *);
+ void ovs_vport_record_error(struct vport *, enum vport_err_type err_type);
++void check_vlan_mpls_hlen(struct sk_buff *skb, unsigned int *vlan_hlen,
++			  unsigned int *mpls_hlen);
++void check_mpls_hlen(struct sk_buff *skb, unsigned int *mpls_hlen);
++void check_skb_vlan_mpls_protocol(struct sk_buff *skb);
++bool mpls_tag_present(struct sk_buff *skb);
++u8 mpls_lse_to_tc(__be32 mpls_lse);
++u8 mpls_lse_to_ttl(__be32 mpls_lse);
+ 
+ /* List of statically compiled vport implementations.  Don't forget to also
+  * add yours to the list at the top of vport.c. */
+diff --git a/include/linux/openvswitch.h b/include/linux/openvswitch.h
+index f5c9cca..63436c7 100644
+--- a/include/linux/openvswitch.h
++++ b/include/linux/openvswitch.h
+@@ -278,6 +278,7 @@ enum ovs_key_attr {
+ 	OVS_KEY_ATTR_ICMPV6,    /* struct ovs_key_icmpv6 */
+ 	OVS_KEY_ATTR_ARP,       /* struct ovs_key_arp */
+ 	OVS_KEY_ATTR_ND,        /* struct ovs_key_nd */
++	OVS_KEY_ATTR_MPLS,      /* be32 MPLS Label Stack Entry */
+ 	OVS_KEY_ATTR_TUN_ID = 63, /* be64 tunnel ID */
+ 	__OVS_KEY_ATTR_MAX
+ };
+@@ -466,6 +467,16 @@ struct ovs_action_push_vlan {
+  * @OVS_ACTION_ATTR_POP_VLAN: Pop the outermost 802.1Q header off the packet.
+  * @OVS_ACTION_ATTR_SAMPLE: Probabilitically executes actions, as specified in
+  * the nested %OVS_SAMPLE_ATTR_* attributes.
++ * @OVS_ACTION_ATTR_PUSH_MPLS: Set the new ethertype and push a new MPLS label.
++ * @OVS_ACTION_ATTR_POP_MPLS: Set the new ethertype and pop the top of stack
++ * MPLS label.
++ * @OVS_ACTION_ATTR_SET_MPLS_LSE: Set the new MPLS label or ttl or traffic class.
++ * @OVS_ACTION_ATTR_DEC_MPLS_TTL: Decrement Time-To-Live associated with MPLS
++ * packet.
++ * @OVS_ACTION_ATTR_COPY_MPLS_TTL_OUT: Copy Time-To-Live from IP/MPLS header to
++ * MPLS header.
++ * @OVS_ACTION_ATTR_COPY_MPLS_TTL_IN: Copy Time-To-Live from MPLS header to
++ * IP header.
+  *
+  * Only a single header can be set with a single %OVS_ACTION_ATTR_SET.  Not all
+  * fields within a header are modifiable, e.g. the IPv4 protocol and fragment
+@@ -480,6 +491,12 @@ enum ovs_action_attr {
+ 	OVS_ACTION_ATTR_PUSH_VLAN,    /* struct ovs_action_push_vlan. */
+ 	OVS_ACTION_ATTR_POP_VLAN,     /* No argument. */
+ 	OVS_ACTION_ATTR_SAMPLE,       /* Nested OVS_SAMPLE_ATTR_*. */
++	OVS_ACTION_ATTR_PUSH_MPLS,    /* be16, ethertype */
++	OVS_ACTION_ATTR_POP_MPLS,     /* be16, ethertype */
++	OVS_ACTION_ATTR_SET_MPLS_LSE, /* be32, mpls label stack entry */
++	OVS_ACTION_ATTR_DEC_MPLS_TTL, /* No argument */
++	OVS_ACTION_ATTR_COPY_TTL_OUT, /* No argument */
++	OVS_ACTION_ATTR_COPY_TTL_IN,  /* No argument */
+ 	__OVS_ACTION_ATTR_MAX
+ };
+ 
+diff --git a/include/openflow/nicira-ext.h b/include/openflow/nicira-ext.h
+index 2f46311..46b831a 100644
+--- a/include/openflow/nicira-ext.h
++++ b/include/openflow/nicira-ext.h
+@@ -338,6 +338,14 @@ enum nx_action_subtype {
+     NXAST_DEC_TTL,              /* struct nx_action_header */
+     NXAST_FIN_TIMEOUT,          /* struct nx_action_fin_timeout */
+     NXAST_CONTROLLER,           /* struct nx_action_controller */
++    NXAST_COPY_TTL_OUT,         /* struct nx_action_header */
++    NXAST_COPY_TTL_IN,          /* struct nx_action_header */
++    NXAST_SET_MPLS_LABEL,       /* struct nx_action_mpls_label */
++    NXAST_SET_MPLS_TC,          /* struct nx_action_mpls_tc */
++    NXAST_SET_MPLS_TTL,         /* struct nx_action_mpls_ttl */
++    NXAST_DEC_MPLS_TTL,         /* struct nx_action_header */
++    NXAST_PUSH_MPLS,            /* struct nx_action_push_mpls */
++    NXAST_POP_MPLS,             /* struct nx_action_pop_mpls */
+ };
+ 
+ /* Header for Nicira-defined actions. */
+@@ -1762,6 +1770,33 @@ OFP_ASSERT(sizeof(struct nx_action_output_reg) == 24);
+ #define NXM_NX_COOKIE     NXM_HEADER  (0x0001, 30, 8)
+ #define NXM_NX_COOKIE_W   NXM_HEADER_W(0x0001, 30, 8)
+ 
++/* The mpls_label in MPLS shim header.
++ *
++ * Prereqs: NXM_OF_ETH_TYPE must be either 0x8847 or 0x8848.
++ *
++ * Format: 32-bit integer, lower 20 bits
++ *
++ * Masking: Not maskable. */
++#define NXM_NX_MPLS_LABEL      NXM_HEADER  (0x0001, 31, 4)
++
++/* The mpls_tc in MPLS shim header.
++ *
++ * Prereqs: NXM_OF_ETH_TYPE must be either 0x8847 or 0x8848.
++ *
++ * Format: 8-bit integer, lower 3 bits
++ *
++ * Masking: Not maskable. */
++#define NXM_NX_MPLS_TC      NXM_HEADER  (0x0001, 32, 1)
++
++/* The mpls_stack in MPLS shim header.
++ *
++ * Prereqs: NXM_OF_ETH_TYPE must be either 0x8847 or 0x8848.
++ *
++ * Format: 8-bit integer, lower 1 bit
++ *
++ * Masking: Not maskable. */
++#define NXM_NX_MPLS_STACK   NXM_HEADER  (0x0001, 33, 1)
++
+ /* ## --------------------- ## */
+ /* ## Requests and replies. ## */
+ /* ## --------------------- ## */
+@@ -1975,4 +2010,59 @@ struct nx_action_controller {
+ };
+ OFP_ASSERT(sizeof(struct nx_action_controller) == 16);
+ 
++/* Action structure for NXAST_SET_MPLS_LABEL. */
++struct nx_action_mpls_label {
++    ovs_be16 type;                  /* OFPAT_SET_MPLS_LABEL. */
++    ovs_be16 len;                   /* Length is 8. */
++    ovs_be32 vendor;                /* NX_VENDOR_ID. */
++    ovs_be16 subtype;               /* NXAST_SET_MPLS_LABEL. */
++    uint8_t pad[2];
++    ovs_be32 mpls_label;            /* MPLS label in low 20 bits. */
++};
++OFP_ASSERT(sizeof(struct nx_action_mpls_label) == 16);
++
++/* Action structure for NXAST_SET_MPLS_TC. */
++struct nx_action_mpls_tc {
++    ovs_be16 type;                  /* OFPAT_SET_MPLS_TC. */
++    ovs_be16 len;                   /* Length is 8. */
++    ovs_be32 vendor;                /* NX_VENDOR_ID. */
++    ovs_be16 subtype;               /* NXAST_SET_MPLS_TC. */
++    uint8_t  mpls_tc;               /* MPLS TC */
++    uint8_t  pad[5];
++};
++OFP_ASSERT(sizeof(struct nx_action_mpls_tc) == 16);
++
++/* Action structure for NXAST_SET_MPLS_TTL. */
++struct nx_action_mpls_ttl {
++    ovs_be16 type;                  /* OFPAT_SET_MPLS_TTL. */
++    ovs_be16 len;                   /* Length is 8. */
++    ovs_be32 vendor;                /* NX_VENDOR_ID. */
++    ovs_be16 subtype;               /* NXAST_SET_MPLS_TTL. */
++    uint8_t  mpls_ttl;              /* MPLS TTL */
++    uint8_t  pad[5];
++};
++OFP_ASSERT(sizeof(struct nx_action_mpls_ttl) == 16);
++
++/* Action structure for NXAST_PUSH_MPLS. */
++struct nx_action_push_mpls {
++    ovs_be16 type;                  /* OFPAT_PUSH_MPLS. */
++    ovs_be16 len;                   /* Length is 8. */
++    ovs_be32 vendor;                /* NX_VENDOR_ID. */
++    ovs_be16 subtype;               /* NXAST_PUSH_MPLS. */
++    ovs_be16 ethertype;             /* Ethertype */
++    uint8_t  pad[4];
++};
++OFP_ASSERT(sizeof(struct nx_action_push_mpls) == 16);
++
++/* Action structure for NXAST_POP_MPLS. */
++struct nx_action_pop_mpls {
++    ovs_be16 type;                  /* OFPAT_POP_MPLS. */
++    ovs_be16 len;                   /* Length is 8. */
++    ovs_be32 vendor;                /* NX_VENDOR_ID. */
++    ovs_be16 subtype;               /* NXAST_POP_MPLS. */
++    ovs_be16 ethertype;             /* Ethertype */
++    uint8_t  pad[4];
++};
++OFP_ASSERT(sizeof(struct nx_action_pop_mpls) == 16);
++
+ #endif /* openflow/nicira-ext.h */
+diff --git a/include/openflow/openflow-1.2.h b/include/openflow/openflow-1.2.h
+index bb55881..300198d 100644
+--- a/include/openflow/openflow-1.2.h
++++ b/include/openflow/openflow-1.2.h
+@@ -114,6 +114,7 @@ enum oxm12_ofb_match_fields {
+     OFPXMT12_OFB_IPV6_ND_TLL,    /* Target link-layer for ND. */
+     OFPXMT12_OFB_MPLS_LABEL,     /* MPLS label. */
+     OFPXMT12_OFB_MPLS_TC,        /* MPLS TC. */
++    OFPXMT12_OFB_MPLS_STACK,     /* MPLS stack. */
+ };
+ 
+ /* OXM implementation makes use of NXM as they are the same format
+@@ -175,6 +176,7 @@ enum oxm12_ofb_match_fields {
+ #define OXM_OF_IPV6_ND_TLL    OXM_HEADER   (OFPXMT12_OFB_IPV6_ND_TLL, 6)
+ #define OXM_OF_MPLS_LABEL     OXM_HEADER   (OFPXMT12_OFB_MPLS_LABEL, 4)
+ #define OXM_OF_MPLS_TC        OXM_HEADER   (OFPXMT12_OFB_MPLS_TC, 1)
++#define OXM_OF_MPLS_STACK     OXM_HEADER   (OFPXMT12_OFB_MPLS_STACK, 1)
+ 
+ /* The VLAN id is 12-bits, so we can use the entire 16 bits to indicate
+  * special conditions.
+diff --git a/lib/classifier.c b/lib/classifier.c
+index d19840c..d3cb9c0 100644
+--- a/lib/classifier.c
++++ b/lib/classifier.c
+@@ -263,6 +263,35 @@ cls_rule_set_dl_vlan_pcp(struct cls_rule *rule, uint8_t dl_vlan_pcp)
+     rule->wc.vlan_tci_mask |= htons(VLAN_CFI | VLAN_PCP_MASK);
+ }
+ 
++/* Modifies 'rule' depending on 'mpls_label':
++ * Makes 'rule' match only packets with an MPLS header whose label equals the
++ * low 20 bits of 'mpls_label'. */
++void
++cls_rule_set_mpls_label(struct cls_rule *rule, ovs_be32 mpls_label)
++{
++    rule->wc.wildcards &= ~FWW_MPLS_LABEL;
++    flow_set_mpls_label(&rule->flow, mpls_label);
++}
++
++/* Modifies 'rule' so that it matches only packets with an MPLS header whose
++ * Traffic Class equals the low 3 bits of 'mpls_tc'. */
++void
++cls_rule_set_mpls_tc(struct cls_rule *rule, uint8_t mpls_tc)
++{
++    rule->wc.wildcards &= ~FWW_MPLS_TC;
++    flow_set_mpls_tc(&rule->flow, mpls_tc);
++}
++
++/* Modifies 'rule' so that it matches only specific packets with
++ * MPLS stack bit set for single label or MPLS stack bit not set for
++ * multiple labels. */
++void
++cls_rule_set_mpls_stack(struct cls_rule *rule, uint8_t mpls_stack)
++{
++    rule->wc.wildcards &= ~FWW_MPLS_STACK;
++    flow_set_mpls_stack(&rule->flow, mpls_stack);
++}
++
+ void
+ cls_rule_set_tp_src(struct cls_rule *rule, ovs_be16 tp_src)
+ {
+@@ -525,7 +554,7 @@ cls_rule_format(const struct cls_rule *rule, struct ds *s)
+ 
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     if (rule->priority != OFP_DEFAULT_PRIORITY) {
+         ds_put_format(s, "priority=%d,", rule->priority);
+@@ -567,6 +596,10 @@ cls_rule_format(const struct cls_rule *rule, struct ds *s)
+             }
+         } else if (f->dl_type == htons(ETH_TYPE_ARP)) {
+             ds_put_cstr(s, "arp,");
++        } else if (f->dl_type == htons(ETH_TYPE_MPLS)) {
++            ds_put_cstr(s, "mpls,");
++        } else if (f->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++            ds_put_cstr(s, "mplsm,");
+         } else {
+             skip_type = false;
+         }
+@@ -663,6 +696,18 @@ cls_rule_format(const struct cls_rule *rule, struct ds *s)
+     if (!(w & FWW_NW_TTL)) {
+         ds_put_format(s, "nw_ttl=%"PRIu8",", f->nw_ttl);
+     }
++    if (!(w & FWW_MPLS_LABEL)) {
++        ds_put_format(s, "mpls_label=%"PRIu32",",
++                 mpls_lse_to_label(f->mpls_lse));
++    }
++    if (!(w & FWW_MPLS_TC)) {
++        ds_put_format(s, "mpls_tc=%"PRIu8",",
++                 mpls_lse_to_tc(f->mpls_lse));
++    }
++    if (!(w & FWW_MPLS_STACK)) {
++        ds_put_format(s, "mpls_stack=%"PRIu8",",
++                 mpls_lse_to_stack(f->mpls_lse));
++    }
+     switch (wc->nw_frag_mask) {
+     case FLOW_NW_FRAG_ANY | FLOW_NW_FRAG_LATER:
+         ds_put_format(s, "nw_frag=%s,",
+@@ -1188,7 +1233,7 @@ flow_equal_except(const struct flow *a, const struct flow *b,
+     const flow_wildcards_t wc = wildcards->wildcards;
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     for (i = 0; i < FLOW_N_REGS; i++) {
+         if ((a->regs[i] ^ b->regs[i]) & wildcards->reg_masks[i]) {
+@@ -1216,6 +1261,12 @@ flow_equal_except(const struct flow *a, const struct flow *b,
+             && (wc & FWW_ARP_SHA || eth_addr_equals(a->arp_sha, b->arp_sha))
+             && (wc & FWW_ARP_THA || eth_addr_equals(a->arp_tha, b->arp_tha))
+             && (wc & FWW_IPV6_LABEL || a->ipv6_label == b->ipv6_label)
++            && (wc & FWW_MPLS_LABEL ||
++                !((a->mpls_lse ^ b->mpls_lse) & htonl(MPLS_LABEL_MASK)))
++            && (wc & FWW_MPLS_TC ||
++                !((a->mpls_lse ^ b->mpls_lse) & htonl(MPLS_TC_MASK)))
++            && (wc & FWW_MPLS_STACK ||
++                !((a->mpls_lse ^ b->mpls_lse) & htonl(MPLS_STACK_MASK)))
+             && ipv6_equal_except(&a->ipv6_src, &b->ipv6_src,
+                     &wildcards->ipv6_src_mask)
+             && ipv6_equal_except(&a->ipv6_dst, &b->ipv6_dst,
+diff --git a/lib/classifier.h b/lib/classifier.h
+index 9e4b33e..9a38d63 100644
+--- a/lib/classifier.h
++++ b/lib/classifier.h
+@@ -108,6 +108,9 @@ void cls_rule_set_any_vid(struct cls_rule *);
+ void cls_rule_set_dl_vlan(struct cls_rule *, ovs_be16);
+ void cls_rule_set_any_pcp(struct cls_rule *);
+ void cls_rule_set_dl_vlan_pcp(struct cls_rule *, uint8_t);
++void cls_rule_set_mpls_label(struct cls_rule *, ovs_be32);
++void cls_rule_set_mpls_tc(struct cls_rule *, uint8_t);
++void cls_rule_set_mpls_stack(struct cls_rule *, uint8_t);
+ void cls_rule_set_tp_src(struct cls_rule *, ovs_be16);
+ void cls_rule_set_tp_src_masked(struct cls_rule *,
+                                 ovs_be16 port, ovs_be16 mask);
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index cade79e..a07e0d4 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -1194,6 +1194,7 @@ execute_set_action(struct ofpbuf *packet, const struct nlattr *a)
+      case OVS_KEY_ATTR_ETHERTYPE:
+      case OVS_KEY_ATTR_IN_PORT:
+      case OVS_KEY_ATTR_VLAN:
++     case OVS_KEY_ATTR_MPLS:
+      case OVS_KEY_ATTR_ICMP:
+      case OVS_KEY_ATTR_ICMPV6:
+      case OVS_KEY_ATTR_ARP:
+@@ -1235,6 +1236,30 @@ dp_netdev_execute_actions(struct dp_netdev *dp,
+             eth_pop_vlan(packet);
+             break;
+ 
++        case OVS_ACTION_ATTR_PUSH_MPLS:
++             push_mpls(packet, nl_attr_get_be16(a));
++             break;
++
++        case OVS_ACTION_ATTR_POP_MPLS:
++             pop_mpls(packet, nl_attr_get_be16(a));
++             break;
++
++        case OVS_ACTION_ATTR_SET_MPLS_LSE:
++             set_mpls_lse(packet, nl_attr_get_be32(a));
++             break;
++
++         case OVS_ACTION_ATTR_DEC_MPLS_TTL:
++             dec_mpls_ttl(packet);
++             break;
++
++        case OVS_ACTION_ATTR_COPY_TTL_IN:
++             copy_mpls_ttl_in(packet);
++             break;
++
++        case OVS_ACTION_ATTR_COPY_TTL_OUT:
++             copy_mpls_ttl_out(packet);
++             break;
++
+         case OVS_ACTION_ATTR_SET:
+             execute_set_action(packet, nl_attr_get(a));
+             break;
+diff --git a/lib/flow.c b/lib/flow.c
+index 46e0e2d..4f4a04b 100644
+--- a/lib/flow.c
++++ b/lib/flow.c
+@@ -89,6 +89,27 @@ pull_icmpv6(struct ofpbuf *packet)
+ }
+ 
+ static void
++parse_remaining_mpls(struct ofpbuf *b)
++{
++    /* Proceed with parsing remaining MPLS headers. */
++    struct mpls_hdr *mh = ofpbuf_pull(b, sizeof *mh);
++    while (!(mh->mpls_lse & htonl(MPLS_STACK_MASK))) {
++        mh = ofpbuf_pull(b, sizeof *mh);
++    }
++}
++
++static void
++parse_mpls(struct ofpbuf *b, struct flow *flow)
++{
++    /* Make sure there is some data following MPLS header
++       before proceeding with parsing MPLS headers. */
++    if (b->size >= sizeof(struct mpls_hdr) + sizeof(ovs_be16)) {
++        struct mpls_hdr *mh = ofpbuf_pull(b, sizeof *mh);
++        flow->mpls_lse = mh->mpls_lse;
++    }
++}
++
++static void
+ parse_vlan(struct ofpbuf *b, struct flow *flow)
+ {
+     struct qtag_prefix {
+@@ -319,6 +340,8 @@ invalid:
+  *
+  *    - packet->l2 to the start of the Ethernet header.
+  *
++ *    - packet->l2_5 to the start of the MPLS shim header.
++ *
+  *    - packet->l3 to just past the Ethernet header, or just past the
+  *      vlan_header if one is present, to the first byte of the payload of the
+  *      Ethernet frame.
+@@ -343,10 +366,11 @@ flow_extract(struct ofpbuf *packet, uint32_t skb_priority, ovs_be64 tun_id,
+     flow->in_port = ofp_in_port;
+     flow->skb_priority = skb_priority;
+ 
+-    packet->l2 = b.data;
+-    packet->l3 = NULL;
+-    packet->l4 = NULL;
+-    packet->l7 = NULL;
++    packet->l2   = b.data;
++    packet->l2_5 = NULL;
++    packet->l3   = NULL;
++    packet->l4   = NULL;
++    packet->l7   = NULL;
+ 
+     if (b.size < sizeof *eth) {
+         return;
+@@ -362,8 +386,18 @@ flow_extract(struct ofpbuf *packet, uint32_t skb_priority, ovs_be64 tun_id,
+     if (eth->eth_type == htons(ETH_TYPE_VLAN)) {
+         parse_vlan(&b, flow);
+     }
++
+     flow->dl_type = parse_ethertype(&b);
+ 
++    if (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++        flow->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        packet->l2_5 = b.data;
++        parse_mpls(&b, flow);
++        if (!(flow->mpls_lse & htonl(MPLS_STACK_MASK))) {
++            parse_remaining_mpls(&b);
++        }
++    }
++
+     /* Network layer. */
+     packet->l3 = b.data;
+     if (flow->dl_type == htons(ETH_TYPE_IP)) {
+@@ -444,7 +478,7 @@ flow_zero_wildcards(struct flow *flow, const struct flow_wildcards *wildcards)
+     const flow_wildcards_t wc = wildcards->wildcards;
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     for (i = 0; i < FLOW_N_REGS; i++) {
+         flow->regs[i] &= wildcards->reg_masks[i];
+@@ -478,6 +512,16 @@ flow_zero_wildcards(struct flow *flow, const struct flow_wildcards *wildcards)
+     if (wc & FWW_NW_TTL) {
+         flow->nw_ttl = 0;
+     }
++    flow->mpls_lse &= ~htonl(MPLS_TTL_MASK);
++    if (wc & FWW_MPLS_LABEL) {
++        flow->mpls_lse &= ~htonl(MPLS_LABEL_MASK);
++    }
++    if (wc & FWW_MPLS_TC) {
++        flow->mpls_lse &= ~htonl(MPLS_TC_MASK);
++    }
++    if (wc & FWW_MPLS_STACK) {
++        flow->mpls_lse &= ~htonl(MPLS_STACK_MASK);
++    }
+     flow->nw_frag &= wildcards->nw_frag_mask;
+     if (wc & FWW_ARP_SHA) {
+         memset(flow->arp_sha, 0, sizeof flow->arp_sha);
+@@ -498,7 +542,7 @@ flow_zero_wildcards(struct flow *flow, const struct flow_wildcards *wildcards)
+ void
+ flow_get_metadata(const struct flow *flow, struct flow_metadata *fmd)
+ {
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     fmd->tun_id = flow->tun_id;
+     fmd->tun_id_mask = htonll(UINT64_MAX);
+@@ -541,6 +585,18 @@ flow_format(struct ds *ds, const struct flow *flow)
+                   ETH_ADDR_ARGS(flow->dl_dst),
+                   ntohs(flow->dl_type));
+ 
++    ds_put_format(ds, ",mpls(");
++    if (flow->mpls_lse) {
++        ds_put_format(ds, "label:%"PRIu32",tc:%d,ttl:%d,bos:%d",
++                      mpls_lse_to_label(flow->mpls_lse),
++                      mpls_lse_to_tc(flow->mpls_lse),
++                      mpls_lse_to_ttl(flow->mpls_lse),
++                      mpls_lse_to_stack(flow->mpls_lse));
++    } else {
++        ds_put_char(ds, '0');
++    }
++    ds_put_char(ds, ')');
++
+     if (flow->dl_type == htons(ETH_TYPE_IPV6)) {
+         ds_put_format(ds, " label:%#"PRIx32" proto:%"PRIu8" tos:%#"PRIx8
+                           " ttl:%"PRIu8" ipv6(",
+@@ -587,7 +643,7 @@ flow_print(FILE *stream, const struct flow *flow)
+ void
+ flow_wildcards_init_catchall(struct flow_wildcards *wc)
+ {
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     wc->wildcards = FWW_ALL;
+     wc->tun_id_mask = htonll(0);
+@@ -611,7 +667,7 @@ flow_wildcards_init_catchall(struct flow_wildcards *wc)
+ void
+ flow_wildcards_init_exact(struct flow_wildcards *wc)
+ {
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     wc->wildcards = 0;
+     wc->tun_id_mask = htonll(UINT64_MAX);
+@@ -637,7 +693,7 @@ flow_wildcards_is_exact(const struct flow_wildcards *wc)
+ {
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     if (wc->wildcards
+         || wc->tun_id_mask != htonll(UINT64_MAX)
+@@ -671,7 +727,7 @@ flow_wildcards_is_catchall(const struct flow_wildcards *wc)
+ {
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     if (wc->wildcards != FWW_ALL
+         || wc->tun_id_mask != htonll(0)
+@@ -708,7 +764,7 @@ flow_wildcards_combine(struct flow_wildcards *dst,
+ {
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     dst->wildcards = src1->wildcards | src2->wildcards;
+     dst->tun_id_mask = src1->tun_id_mask & src2->tun_id_mask;
+@@ -749,7 +805,7 @@ flow_wildcards_equal(const struct flow_wildcards *a,
+ {
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     if (a->wildcards != b->wildcards
+         || a->tun_id_mask != b->tun_id_mask
+@@ -785,7 +841,7 @@ flow_wildcards_has_extra(const struct flow_wildcards *a,
+     uint8_t eth_masked[ETH_ADDR_LEN];
+     struct in6_addr ipv6_masked;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     for (i = 0; i < FLOW_N_REGS; i++) {
+         if ((a->reg_masks[i] & b->reg_masks[i]) != b->reg_masks[i]) {
+@@ -958,6 +1014,39 @@ flow_set_vlan_pcp(struct flow *flow, uint8_t pcp)
+     flow->vlan_tci |= htons((pcp << VLAN_PCP_SHIFT) | VLAN_CFI);
+ }
+ 
++/* Sets the MPLS Label that 'flow' matches to 'label', which is interpreted
++ * as an OpenFlow 1.1 "mpls_label" value. */
++void
++flow_set_mpls_label(struct flow *flow, ovs_be32 label)
++{
++    if (label == htonl(0)) {
++        flow->mpls_lse = htonl(0);
++    } else {
++        flow->mpls_lse &= ~htonl(MPLS_LABEL_MASK);
++        flow->mpls_lse |=
++            htonl((ntohl(label) << MPLS_LABEL_SHIFT) & MPLS_LABEL_MASK);
++    }
++}
++
++/* Sets the MPLS TC that 'flow' matches to 'tc', which should be in the
++ * range 0...7. */
++void
++flow_set_mpls_tc(struct flow *flow, uint8_t tc)
++{
++    tc &= 0x07;
++    flow->mpls_lse &= ~htonl(MPLS_TC_MASK);
++    flow->mpls_lse |= htonl(tc << MPLS_TC_SHIFT);
++}
++
++/* Sets the MPLS STACK bit that 'flow' matches to which should be 0 or 1. */
++void
++flow_set_mpls_stack(struct flow *flow, uint8_t stack)
++{
++    stack &= 0x01;
++    flow->mpls_lse &= ~htonl(MPLS_STACK_MASK);
++    flow->mpls_lse |= htonl(stack << MPLS_STACK_SHIFT);
++}
++
+ /* Puts into 'b' a packet that flow_extract() would parse as having the given
+  * 'flow'.
+  *
+@@ -978,7 +1067,11 @@ flow_compose(struct ofpbuf *b, const struct flow *flow)
+         eth_push_vlan(b, flow->vlan_tci);
+     }
+ 
+-    if (flow->dl_type == htons(ETH_TYPE_IP)) {
++    if (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++        flow->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        push_mpls(b, flow->dl_type);
++        set_mpls_lse(b, flow->mpls_lse);
++    } else if (flow->dl_type == htons(ETH_TYPE_IP)) {
+         struct ip_header *ip;
+ 
+         b->l3 = ip = ofpbuf_put_zeros(b, sizeof *ip);
+diff --git a/lib/flow.h b/lib/flow.h
+index 2958ff5..328938c 100644
+--- a/lib/flow.h
++++ b/lib/flow.h
+@@ -34,7 +34,7 @@ struct ofpbuf;
+ /* This sequence number should be incremented whenever anything involving flows
+  * or the wildcarding of flows changes.  This will cause build assertion
+  * failures in places which likely need to be updated. */
+-#define FLOW_WC_SEQ 11
++#define FLOW_WC_SEQ 12
+ 
+ #define FLOW_N_REGS 8
+ BUILD_ASSERT_DECL(FLOW_N_REGS <= NXM_NX_MAX_REGS);
+@@ -61,6 +61,7 @@ struct flow {
+     ovs_be32 nw_src;            /* IPv4 source address. */
+     ovs_be32 nw_dst;            /* IPv4 destination address. */
+     ovs_be32 ipv6_label;        /* IPv6 flow label. */
++    ovs_be32 mpls_lse;          /* MPLS label stack entry. */
+     uint16_t in_port;           /* OpenFlow port number of input port. */
+     ovs_be16 vlan_tci;          /* If 802.1Q, TCI | VLAN_CFI; otherwise 0. */
+     ovs_be16 dl_type;           /* Ethernet frame type. */
+@@ -74,7 +75,7 @@ struct flow {
+     uint8_t arp_tha[6];         /* ARP/ND target hardware address. */
+     uint8_t nw_ttl;             /* IP TTL/Hop Limit. */
+     uint8_t nw_frag;            /* FLOW_FRAG_* flags. */
+-    uint8_t reserved[2];        /* Reserved for 64-bit packing. */
++    uint8_t reserved[6];        /* Reserved for 64-bit packing. */
+ };
+ 
+ /* Represents the metadata fields of struct flow.  The masks are used to
+@@ -92,14 +93,14 @@ struct flow_metadata {
+ 
+ /* Assert that there are FLOW_SIG_SIZE bytes of significant data in "struct
+  * flow", followed by FLOW_PAD_SIZE bytes of padding. */
+-#define FLOW_SIG_SIZE (110 + FLOW_N_REGS * 4)
+-#define FLOW_PAD_SIZE 2
++#define FLOW_SIG_SIZE (114 + FLOW_N_REGS * 4)
++#define FLOW_PAD_SIZE 6
+ BUILD_ASSERT_DECL(offsetof(struct flow, nw_frag) == FLOW_SIG_SIZE - 1);
+ BUILD_ASSERT_DECL(sizeof(((struct flow *)0)->nw_frag) == 1);
+ BUILD_ASSERT_DECL(sizeof(struct flow) == FLOW_SIG_SIZE + FLOW_PAD_SIZE);
+ 
+ /* Remember to update FLOW_WC_SEQ when changing 'struct flow'. */
+-BUILD_ASSERT_DECL(FLOW_SIG_SIZE == 142 && FLOW_WC_SEQ == 11);
++BUILD_ASSERT_DECL(FLOW_SIG_SIZE == 146 && FLOW_WC_SEQ == 12);
+ 
+ void flow_extract(struct ofpbuf *, uint32_t priority, ovs_be64 tun_id,
+                   uint16_t in_port, struct flow *);
+@@ -116,6 +117,10 @@ static inline size_t flow_hash(const struct flow *, uint32_t basis);
+ void flow_set_vlan_vid(struct flow *, ovs_be16 vid);
+ void flow_set_vlan_pcp(struct flow *, uint8_t pcp);
+ 
++void flow_set_mpls_label(struct flow *flow, ovs_be32 label);
++void flow_set_mpls_tc(struct flow *flow, uint8_t tc);
++void flow_set_mpls_stack(struct flow *flow, uint8_t stack);
++
+ void flow_compose(struct ofpbuf *, const struct flow *);
+ 
+ static inline int
+@@ -155,10 +160,13 @@ typedef unsigned int OVS_BITWISE flow_wildcards_t;
+ #define FWW_ARP_THA     ((OVS_FORCE flow_wildcards_t) (1 << 6))
+ #define FWW_IPV6_LABEL  ((OVS_FORCE flow_wildcards_t) (1 << 7))
+ #define FWW_NW_TTL      ((OVS_FORCE flow_wildcards_t) (1 << 8))
+-#define FWW_ALL         ((OVS_FORCE flow_wildcards_t) (((1 << 9)) - 1))
++#define FWW_MPLS_LABEL  ((OVS_FORCE flow_wildcards_t) (1 << 9))
++#define FWW_MPLS_TC     ((OVS_FORCE flow_wildcards_t) (1 << 10))
++#define FWW_MPLS_STACK  ((OVS_FORCE flow_wildcards_t) (1 << 11))
++#define FWW_ALL         ((OVS_FORCE flow_wildcards_t) (((1 << 12)) - 1))
+ 
+ /* Remember to update FLOW_WC_SEQ when adding or removing FWW_*. */
+-BUILD_ASSERT_DECL(FWW_ALL == ((1 << 9) - 1) && FLOW_WC_SEQ == 11);
++BUILD_ASSERT_DECL(FWW_ALL == ((1 << 12) - 1) && FLOW_WC_SEQ == 12);
+ 
+ /* Information on wildcards for a flow, as a supplement to "struct flow".
+  *
+@@ -184,7 +192,7 @@ struct flow_wildcards {
+ };
+ 
+ /* Remember to update FLOW_WC_SEQ when updating struct flow_wildcards. */
+-BUILD_ASSERT_DECL(sizeof(struct flow_wildcards) == 120 && FLOW_WC_SEQ == 11);
++BUILD_ASSERT_DECL(sizeof(struct flow_wildcards) == 120 && FLOW_WC_SEQ == 12);
+ 
+ void flow_wildcards_init_catchall(struct flow_wildcards *);
+ void flow_wildcards_init_exact(struct flow_wildcards *);
+diff --git a/lib/learn.c b/lib/learn.c
+index cbecb10..5478b74 100644
+--- a/lib/learn.c
++++ b/lib/learn.c
+@@ -184,7 +184,7 @@ learn_check(const struct nx_action_learn *learn, const struct flow *flow)
+                      * prerequisites.  No prerequisite depends on the value of
+                      * a field that is wider than 64 bits.  So just skip
+                      * setting it entirely. */
+-                    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++                    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+                 }
+             }
+         }
+diff --git a/lib/meta-flow.c b/lib/meta-flow.c
+index b3a4bff..f92b46b 100644
+--- a/lib/meta-flow.c
++++ b/lib/meta-flow.c
+@@ -168,6 +168,38 @@ static const struct mf_field mf_fields[MFF_N_IDS] = {
+         OXM_OF_VLAN_PCP, "OXM_OF_VLAN_PCP",
+     },
+ 
++    /* ## ---- ## */
++    /* ## L2.5 ## */
++    /* ## ---- ## */
++    {
++        MFF_MPLS_LABEL, "mpls_label", NULL,
++        4, 20,
++        MFM_NONE, FWW_MPLS_LABEL,
++        MFS_DECIMAL,
++        MFP_MPLS,
++        true,
++        NXM_NX_MPLS_LABEL, "NXM_NX_MPLS_LABEL",
++        0, NULL,
++    }, {
++        MFF_MPLS_TC, "mpls_tc", NULL,
++        1, 3,
++        MFM_NONE, FWW_MPLS_TC,
++        MFS_DECIMAL,
++        MFP_MPLS,
++        true,
++        NXM_NX_MPLS_TC, "NXM_NX_MPLS_TC",
++        0, NULL,
++    }, {
++        MFF_MPLS_STACK, "mpls_stack", NULL,
++        1, 1,
++        MFM_NONE, FWW_MPLS_STACK,
++        MFS_DECIMAL,
++        MFP_MPLS,
++        true,
++        NXM_NX_MPLS_STACK, "NXM_NX_MPLS_STACK",
++        0, NULL,
++    },
++
+     /* ## -- ## */
+     /* ## L3 ## */
+     /* ## -- ## */
+@@ -585,6 +617,9 @@ mf_is_all_wild(const struct mf_field *mf, const struct flow_wildcards *wc)
+     case MFF_ARP_THA:
+     case MFF_ND_SLL:
+     case MFF_ND_TLL:
++    case MFF_MPLS_LABEL:
++    case MFF_MPLS_TC:
++    case MFF_MPLS_STACK:
+         assert(mf->fww_bit != 0);
+         return (wc->wildcards & mf->fww_bit) != 0;
+ 
+@@ -693,6 +728,9 @@ mf_get_mask(const struct mf_field *mf, const struct flow_wildcards *wc,
+     case MFF_ARP_THA:
+     case MFF_ND_SLL:
+     case MFF_ND_TLL:
++    case MFF_MPLS_LABEL:
++    case MFF_MPLS_TC:
++    case MFF_MPLS_STACK:
+         assert(mf->fww_bit != 0);
+         memset(mask, wc->wildcards & mf->fww_bit ? 0x00 : 0xff, mf->n_bytes);
+         break;
+@@ -854,6 +892,9 @@ mf_are_prereqs_ok(const struct mf_field *mf, const struct flow *flow)
+         return flow->dl_type == htons(ETH_TYPE_IP);
+     case MFP_IPV6:
+         return flow->dl_type == htons(ETH_TYPE_IPV6);
++    case MFP_MPLS:
++        return (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++                flow->dl_type == htons(ETH_TYPE_MPLS_MCAST));
+     case MFP_IP_ANY:
+         return is_ip_any(flow);
+ 
+@@ -973,6 +1014,15 @@ mf_is_value_valid(const struct mf_field *mf, const union mf_value *value)
+     case MFF_IPV6_LABEL:
+         return !(value->be32 & ~htonl(IPV6_LABEL_MASK));
+ 
++    case MFF_MPLS_LABEL:
++        return !(value->be32 & ~htonl(MPLS_LABEL_MASK >> MPLS_LABEL_SHIFT));
++
++    case MFF_MPLS_TC:
++        return !(value->u8 & ~7);
++
++    case MFF_MPLS_STACK:
++        return !(value->u8 & ~1);
++
+     case MFF_N_IDS:
+     default:
+         NOT_REACHED();
+@@ -1048,6 +1098,18 @@ mf_get_value(const struct mf_field *mf, const struct flow *flow,
+         value->u8 = vlan_tci_to_pcp(flow->vlan_tci);
+         break;
+ 
++    case MFF_MPLS_LABEL:
++        value->be32 = htonl(mpls_lse_to_label(flow->mpls_lse));
++        break;
++
++    case MFF_MPLS_TC:
++        value->u8 = mpls_lse_to_tc(flow->mpls_lse);
++        break;
++
++    case MFF_MPLS_STACK:
++        value->u8 = mpls_lse_to_stack(flow->mpls_lse);
++        break;
++
+     case MFF_IPV4_SRC:
+         value->be32 = flow->nw_src;
+         break;
+@@ -1254,6 +1316,18 @@ mf_set_value(const struct mf_field *mf,
+         cls_rule_set_nw_ttl(rule, value->u8);
+         break;
+ 
++    case MFF_MPLS_LABEL:
++        cls_rule_set_mpls_label(rule, value->be32);
++        break;
++
++    case MFF_MPLS_TC:
++        cls_rule_set_mpls_tc(rule, value->u8);
++        break;
++
++    case MFF_MPLS_STACK:
++        cls_rule_set_mpls_stack(rule, value->u8);
++        break;
++
+     case MFF_IP_FRAG:
+         cls_rule_set_nw_frag(rule, value->u8);
+         break;
+@@ -1388,6 +1462,18 @@ mf_set_flow_value(const struct mf_field *mf,
+         flow_set_vlan_pcp(flow, value->u8);
+         break;
+ 
++    case MFF_MPLS_LABEL:
++        flow_set_mpls_label(flow, value->be32);
++        break;
++
++    case MFF_MPLS_TC:
++        flow_set_mpls_tc(flow, value->u8);
++        break;
++
++    case MFF_MPLS_STACK:
++        flow_set_mpls_stack(flow, value->u8);
++        break;
++
+     case MFF_IPV4_SRC:
+         flow->nw_src = value->be32;
+         break;
+@@ -1628,6 +1714,21 @@ mf_set_wild(const struct mf_field *mf, struct cls_rule *rule)
+         rule->flow.nw_ttl = 0;
+         break;
+ 
++    case MFF_MPLS_LABEL:
++        rule->wc.wildcards |= FWW_MPLS_LABEL;
++        rule->flow.mpls_lse &= ~htonl(MPLS_LABEL_MASK);
++        break;
++
++    case MFF_MPLS_TC:
++        rule->wc.wildcards |= FWW_MPLS_TC;
++        rule->flow.mpls_lse &= ~htonl(MPLS_TC_MASK);
++        break;
++
++    case MFF_MPLS_STACK:
++        rule->wc.wildcards |= FWW_MPLS_STACK;
++        rule->flow.mpls_lse &= ~htonl(MPLS_STACK_MASK);
++        break;
++
+     case MFF_IP_FRAG:
+         rule->wc.nw_frag_mask |= FLOW_NW_FRAG_MASK;
+         rule->flow.nw_frag &= ~FLOW_NW_FRAG_MASK;
+@@ -1707,6 +1808,9 @@ mf_set(const struct mf_field *mf,
+     case MFF_VLAN_VID:
+     case MFF_VLAN_PCP:
+     case MFF_IPV6_LABEL:
++    case MFF_MPLS_LABEL:
++    case MFF_MPLS_TC:
++    case MFF_MPLS_STACK:
+     case MFF_IP_PROTO:
+     case MFF_IP_TTL:
+     case MFF_IP_DSCP:
+@@ -1967,6 +2071,18 @@ mf_random_value(const struct mf_field *mf, union mf_value *value)
+         value->u8 &= 0x07;
+         break;
+ 
++    case MFF_MPLS_LABEL:
++        value->be32 &= htonl(MPLS_LABEL_MASK >> MPLS_LABEL_SHIFT);
++        break;
++
++    case MFF_MPLS_TC:
++        value->u8 &= 0x07;
++        break;
++
++    case MFF_MPLS_STACK:
++        value->u8 &= 0x01;
++        break;
++
+     case MFF_N_IDS:
+     default:
+         NOT_REACHED();
+diff --git a/lib/meta-flow.h b/lib/meta-flow.h
+index ffde5cc..c61f2c8 100644
+--- a/lib/meta-flow.h
++++ b/lib/meta-flow.h
+@@ -71,6 +71,11 @@ enum mf_field_id {
+     MFF_VLAN_VID,               /* be16 */
+     MFF_VLAN_PCP,               /* u8 */
+ 
++    /* L2.5 */
++    MFF_MPLS_LABEL,             /* be32 */
++    MFF_MPLS_TC,                /* u8 */
++    MFF_MPLS_STACK,             /* u8 */
++
+     /* L3. */
+     MFF_IPV4_SRC,               /* be32 */
+     MFF_IPV4_DST,               /* be32 */
+@@ -122,6 +127,7 @@ enum mf_prereqs {
+ 
+     /* L2 requirements. */
+     MFP_ARP,
++    MFP_MPLS,
+     MFP_IPV4,
+     MFP_IPV6,
+     MFP_IP_ANY,
+@@ -177,6 +183,9 @@ struct mf_field {
+      *     - "dl_vlan_pcp" is 1 byte but only 3 bits.
+      *     - "is_frag" is 1 byte but only 2 bits.
+      *     - "ipv6_label" is 4 bytes but only 20 bits.
++     *     - "mpls_label" is 4 bytes but only 20 bits.
++     *     - "mpls_tc"    is 1 byte but only 3 bits.
++     *     - "mpls_stack" is 1 byte but only 1 bit.
+      */
+     unsigned int n_bytes;       /* Width of the field in bytes. */
+     unsigned int n_bits;        /* Number of significant bits in field. */
+diff --git a/lib/nx-match.c b/lib/nx-match.c
+index 920184c..40fbb04 100644
+--- a/lib/nx-match.c
++++ b/lib/nx-match.c
+@@ -487,7 +487,7 @@ nx_put_match(struct ofpbuf *b, bool oxm, const struct cls_rule *cr,
+     int match_len;
+     int i;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     /* Metadata. */
+     if (!(wc & FWW_IN_PORT)) {
+@@ -514,6 +514,27 @@ nx_put_match(struct ofpbuf *b, bool oxm, const struct cls_rule *cr,
+      * XXX missing OXM support */
+     nxm_put_16m(b, NXM_OF_VLAN_TCI, flow->vlan_tci, cr->wc.vlan_tci_mask);
+ 
++
++    /* MPLS. */
++    if (!(wc & FWW_DL_TYPE) &&
++       (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++        flow->dl_type == htons(ETH_TYPE_MPLS_MCAST))) {
++        if (!(wc & FWW_MPLS_TC)) {
++            nxm_put_8(b, oxm ? OXM_OF_MPLS_TC : NXM_NX_MPLS_TC,
++                      mpls_lse_to_tc(flow->mpls_lse));
++        }
++
++        if (!(wc & FWW_MPLS_STACK)) {
++            nxm_put_8(b, oxm ? OXM_OF_MPLS_STACK : NXM_NX_MPLS_STACK,
++                      mpls_lse_to_stack(flow->mpls_lse));
++        }
++
++        if (!(wc & FWW_MPLS_LABEL)) {
++            nxm_put_32(b, oxm ? OXM_OF_MPLS_LABEL : NXM_NX_MPLS_LABEL,
++                 htonl(mpls_lse_to_label(flow->mpls_lse)));
++        }
++    }
++
+     /* L3. */
+     if (!(wc & FWW_DL_TYPE) && flow->dl_type == htons(ETH_TYPE_IP)) {
+         /* IP. */
+diff --git a/lib/nx-match.h b/lib/nx-match.h
+index 22db477..b8d194b 100644
+--- a/lib/nx-match.h
++++ b/lib/nx-match.h
+@@ -90,7 +90,7 @@ void nxm_decode(struct mf_subfield *, ovs_be32 header, ovs_be16 ofs_nbits);
+ void nxm_decode_discrete(struct mf_subfield *, ovs_be32 header,
+                          ovs_be16 ofs, ovs_be16 n_bits);
+ 
+-BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ /* Upper bound on the length of an nx_match.  The longest nx_match (an
+  * IPV6 neighbor discovery message using 5 registers) would be:
+  *
+diff --git a/lib/odp-util.c b/lib/odp-util.c
+index 0574c9f..2dfa32f 100644
+--- a/lib/odp-util.c
++++ b/lib/odp-util.c
+@@ -16,6 +16,7 @@
+ 
+ #include <arpa/inet.h>
+ #include <config.h>
++#include <assert.h>
+ #include "odp-util.h"
+ #include <errno.h>
+ #include <inttypes.h>
+@@ -73,6 +74,12 @@ odp_action_len(uint16_t type)
+     case OVS_ACTION_ATTR_USERSPACE: return -2;
+     case OVS_ACTION_ATTR_PUSH_VLAN: return sizeof(struct ovs_action_push_vlan);
+     case OVS_ACTION_ATTR_POP_VLAN: return 0;
++    case OVS_ACTION_ATTR_PUSH_MPLS: return sizeof(ovs_be16);
++    case OVS_ACTION_ATTR_POP_MPLS:  return sizeof(ovs_be16);
++    case OVS_ACTION_ATTR_SET_MPLS_LSE: return sizeof(ovs_be32);
++    case OVS_ACTION_ATTR_DEC_MPLS_TTL: return 0;
++    case OVS_ACTION_ATTR_COPY_TTL_IN: return 0;
++    case OVS_ACTION_ATTR_COPY_TTL_OUT: return 0;
+     case OVS_ACTION_ATTR_SET: return -2;
+     case OVS_ACTION_ATTR_SAMPLE: return -2;
+ 
+@@ -106,6 +113,7 @@ ovs_key_attr_to_string(enum ovs_key_attr attr)
+     case OVS_KEY_ATTR_ARP: return "arp";
+     case OVS_KEY_ATTR_ND: return "nd";
+     case OVS_KEY_ATTR_TUN_ID: return "tun_id";
++    case OVS_KEY_ATTR_MPLS: return "mpls";
+ 
+     case __OVS_KEY_ATTR_MAX:
+     default:
+@@ -273,11 +281,34 @@ format_vlan_tci(struct ds *ds, ovs_be16 vlan_tci)
+ }
+ 
+ static void
++format_mpls_lse(struct ds *ds, ovs_be32 mpls_lse)
++{
++    ds_put_format(ds, "label=%"PRIu32",tc=%d,ttl=%d,bos=%d",
++                  mpls_lse_to_label(mpls_lse),
++                  mpls_lse_to_tc(mpls_lse),
++                  mpls_lse_to_ttl(mpls_lse),
++                  mpls_lse_to_stack(mpls_lse));
++}
++
++static ovs_be32
++format_mpls_lse_values(int mpls_label, int mpls_tc,
++                       int mpls_ttl, int mpls_stack)
++{
++    return(htonl((mpls_label << MPLS_LABEL_SHIFT) |
++                 (mpls_tc << MPLS_TC_SHIFT)       |
++                 (mpls_ttl << MPLS_TTL_SHIFT)     |
++                 (mpls_stack << MPLS_STACK_SHIFT)));
++}
++
++static void
+ format_odp_action(struct ds *ds, const struct nlattr *a)
+ {
+     int expected_len;
+     enum ovs_action_attr type = nl_attr_type(a);
+     const struct ovs_action_push_vlan *vlan;
++    ovs_be16 push_ethertype;
++    ovs_be16 pop_ethertype;
++    ovs_be32 mpls_lse;
+ 
+     expected_len = odp_action_len(nl_attr_type(a));
+     if (expected_len != -2 && nl_attr_get_size(a) != expected_len) {
+@@ -311,6 +342,31 @@ format_odp_action(struct ds *ds, const struct nlattr *a)
+     case OVS_ACTION_ATTR_POP_VLAN:
+         ds_put_cstr(ds, "pop_vlan");
+         break;
++   case OVS_ACTION_ATTR_PUSH_MPLS:
++        push_ethertype = nl_attr_get_be16(a);
++        ds_put_format(ds, "push_mpls(eth_type=0x%"PRIx16")",
++                      ntohs(push_ethertype));
++        break;
++    case OVS_ACTION_ATTR_POP_MPLS:
++        pop_ethertype = nl_attr_get_be16(a);
++        ds_put_format(ds, "pop_mpls(eth_type=0x%"PRIx16")",
++                      ntohs(pop_ethertype));
++        break;
++    case OVS_ACTION_ATTR_SET_MPLS_LSE:
++        mpls_lse = nl_attr_get_be32(a);
++        ds_put_cstr(ds, "mpls_lse(");
++        format_mpls_lse(ds, mpls_lse);
++        ds_put_char(ds, ')');
++        break;
++    case OVS_ACTION_ATTR_DEC_MPLS_TTL:
++        ds_put_format(ds, "dec_mpls_ttl");
++        break;
++    case OVS_ACTION_ATTR_COPY_TTL_IN:
++        ds_put_format(ds, "copy_ttl_in");
++        break;
++    case OVS_ACTION_ATTR_COPY_TTL_OUT:
++        ds_put_format(ds, "copy_ttl_out");
++        break;
+     case OVS_ACTION_ATTR_SAMPLE:
+         format_odp_sample_action(ds, a);
+         break;
+@@ -511,6 +567,60 @@ parse_odp_action(const char *s, const struct simap *port_names,
+     }
+ 
+     {
++        ovs_be32 mpls_lse;
++        int label, tc, ttl, bos;
++        int n = -1;
++
++        if ((sscanf(s, "mpls_lse(label=%i,tc=%i,ttl=%i,bos=%i)%n",
++            &label, &tc, &ttl, &bos, &n) > 0 && n > 0)) {
++            mpls_lse = format_mpls_lse_values(label, tc, ttl, bos);
++            nl_msg_put_be32(actions, OVS_ACTION_ATTR_SET_MPLS_LSE, mpls_lse);
++            return n;
++        }
++    }
++
++    {
++        ovs_be16 push_ethertype;
++        int etype;
++        int n = -1;
++
++        if ((sscanf(s, "push_mpls(eth_type=%i)%n", &etype, &n) > 0 && n > 0)) {
++            push_ethertype = htons(etype);
++            nl_msg_put_be16(actions, OVS_ACTION_ATTR_PUSH_MPLS, push_ethertype);
++
++            return n;
++        }
++    }
++
++    {
++        ovs_be16 pop_ethertype;
++        int etype;
++        int n = -1;
++
++        if ((sscanf(s, "pop_mpls(eth_type=%i)%n", &etype, &n) > 0 && n > 0)) {
++            pop_ethertype = htons(etype);
++            nl_msg_put_be16(actions, OVS_ACTION_ATTR_POP_MPLS, pop_ethertype);
++
++            return n;
++        }
++    }
++
++    if (!strncmp(s, "dec_mpls_ttl", 12)) {
++        nl_msg_put_flag(actions, OVS_ACTION_ATTR_DEC_MPLS_TTL);
++        return 12;
++    }
++
++    if (!strncmp(s, "copy_ttl_in", 11)) {
++        nl_msg_put_flag(actions, OVS_ACTION_ATTR_COPY_TTL_IN);
++        return 11;
++    }
++
++    if (!strncmp(s, "copy_ttl_out", 12)) {
++        nl_msg_put_flag(actions, OVS_ACTION_ATTR_COPY_TTL_OUT);
++        return 12;
++    }
++
++    {
+         double percentage;
+         int n = -1;
+ 
+@@ -614,6 +724,7 @@ odp_flow_key_attr_len(uint16_t type)
+     case OVS_KEY_ATTR_ICMPV6: return sizeof(struct ovs_key_icmpv6);
+     case OVS_KEY_ATTR_ARP: return sizeof(struct ovs_key_arp);
+     case OVS_KEY_ATTR_ND: return sizeof(struct ovs_key_nd);
++    case OVS_KEY_ATTR_MPLS: return sizeof(ovs_be32);
+ 
+     case OVS_KEY_ATTR_UNSPEC:
+     case __OVS_KEY_ATTR_MAX:
+@@ -715,6 +826,12 @@ format_odp_key_attr(const struct nlattr *a, struct ds *ds)
+         ds_put_char(ds, ')');
+         break;
+ 
++    case OVS_KEY_ATTR_MPLS:
++        ds_put_char(ds, '(');
++        format_mpls_lse(ds, nl_attr_get_be32(a));
++        ds_put_char(ds, ')');
++        break;
++
+     case OVS_KEY_ATTR_ETHERTYPE:
+         ds_put_format(ds, "(0x%04"PRIx16")",
+                       ntohs(nl_attr_get_be16(a)));
+@@ -984,6 +1101,21 @@ parse_odp_key_attr(const char *s, const struct simap *port_names,
+     }
+ 
+     {
++        int mpls_label, mpls_tc, mpls_ttl, mpls_stack;
++        ovs_be32 mpls_lse;
++        int n = -1;
++
++        if (sscanf(s, "mpls(label=%"SCNi32",tc=%i,ttl=%i,bos=%i)%n",
++                    &mpls_label, &mpls_tc, &mpls_ttl, &mpls_stack, &n) > 0 &&
++                    n > 0) {
++            mpls_lse = format_mpls_lse_values(mpls_label, mpls_tc,
++                                              mpls_ttl, mpls_stack);
++            nl_msg_put_be32(key, OVS_KEY_ATTR_MPLS, mpls_lse);
++            return n;
++        }
++    }
++
++    {
+         ovs_be32 ipv4_src;
+         ovs_be32 ipv4_dst;
+         int ipv4_proto;
+@@ -1291,6 +1423,11 @@ odp_flow_key_from_flow(struct ofpbuf *buf, const struct flow *flow)
+ 
+     nl_msg_put_be16(buf, OVS_KEY_ATTR_ETHERTYPE, flow->dl_type);
+ 
++    if (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++        flow->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        nl_msg_put_be32(buf, OVS_KEY_ATTR_MPLS, flow->mpls_lse);
++    }
++
+     if (flow->dl_type == htons(ETH_TYPE_IP)) {
+         struct ovs_key_ipv4 *ipv4_key;
+ 
+@@ -1531,6 +1668,38 @@ parse_ethertype(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
+     return true;
+ }
+ 
++/* Parse MPLS header attributes. */
++static enum odp_key_fitness
++parse_mpls_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
++                   uint64_t present_attrs, int out_of_range_attr,
++                   uint64_t expected_attrs, struct flow *flow,
++                   const struct nlattr *key, size_t key_len)
++{
++    enum odp_key_fitness fitness;
++    ovs_be32 mpls_lse;
++
++    /* Calulate fitness of outer attributes. */
++    expected_attrs |= (UINT64_C(1) << OVS_KEY_ATTR_MPLS);
++    fitness = check_expectations(present_attrs, out_of_range_attr,
++                                 expected_attrs, key, key_len);
++
++    /* Get the MPLS LSE value. */
++    if (!(present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_MPLS))) {
++        return ODP_FIT_TOO_LITTLE;
++    }
++    mpls_lse = nl_attr_get_be32(attrs[OVS_KEY_ATTR_MPLS]);
++    if (mpls_lse == htonl(0)) {
++        /* Corner case for a truncated MPLS header. */
++        return fitness;
++    }
++
++    /* Set mpls_lse. */
++    flow->mpls_lse = mpls_lse;
++
++    return check_expectations(present_attrs, out_of_range_attr, expected_attrs,
++                              key, key_len);
++}
++
+ static enum odp_key_fitness
+ parse_l3_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
+                 uint64_t present_attrs, int out_of_range_attr,
+@@ -1539,7 +1708,13 @@ parse_l3_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
+ {
+     static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
+ 
+-    if (flow->dl_type == htons(ETH_TYPE_IP)) {
++    /* Parse MPLS label stack entry */
++    if (flow->dl_type == htons(ETH_TYPE_MPLS) ||
++        flow->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++
++        return parse_mpls_onward(attrs, present_attrs, out_of_range_attr,
++                                  expected_attrs, flow, key, key_len);
++    } else if (flow->dl_type == htons(ETH_TYPE_IP)) {
+         expected_attrs |= UINT64_C(1) << OVS_KEY_ATTR_IPV4;
+         if (present_attrs & (UINT64_C(1) << OVS_KEY_ATTR_IPV4)) {
+             const struct ovs_key_ipv4 *ipv4_key;
+@@ -1709,8 +1884,10 @@ parse_8021q_onward(const struct nlattr *attrs[OVS_KEY_ATTR_MAX + 1],
+     if (!parse_ethertype(attrs, present_attrs, &expected_attrs, flow)) {
+         return ODP_FIT_ERROR;
+     }
+-    encap_fitness = parse_l3_onward(attrs, present_attrs, out_of_range_attr,
+-                                    expected_attrs, flow, key, key_len);
++
++    encap_fitness = parse_l3_onward(attrs, present_attrs,
++                                    out_of_range_attr, expected_attrs,
++                                    flow, key, key_len);
+ 
+     /* The overall fitness is the worse of the outer and inner attributes. */
+     return MAX(fitness, encap_fitness);
+@@ -1789,6 +1966,7 @@ odp_flow_key_to_flow(const struct nlattr *key, size_t key_len,
+         return parse_8021q_onward(attrs, present_attrs, out_of_range_attr,
+                                   expected_attrs, flow, key, key_len);
+     }
++
+     return parse_l3_onward(attrs, present_attrs, out_of_range_attr,
+                            expected_attrs, flow, key, key_len);
+ }
+@@ -1956,6 +2134,63 @@ commit_set_ipv6_action(const struct flow *flow, struct flow *base,
+                       &ipv6_key, sizeof(ipv6_key));
+ }
+ 
++/* Handle MPLS Push action. Update flow based on incoming packet. */
++void
++commit_mpls_push_action(struct flow *flow, struct flow *base,
++                        struct ofpbuf *odp_actions, ovs_be16 eth_type)
++{
++    ovs_be32 mpls_label, mpls_tc, mpls_ttl, mpls_stack;
++    assert(eth_type == htons(ETH_TYPE_MPLS) ||
++           eth_type == htons(ETH_TYPE_MPLS_MCAST));
++
++    if (base->mpls_lse != htonl(0)) {
++        flow->mpls_lse = base->mpls_lse;
++        flow->mpls_lse &= ~htonl(MPLS_STACK_MASK);
++    } else {
++        flow->mpls_lse &= ~htonl(MPLS_LABEL_MASK | MPLS_TC_MASK |
++                                 MPLS_TTL_MASK | MPLS_STACK_MASK);
++        if (flow->dl_type == htons(ETH_TYPE_IPV6)) {
++            mpls_label = htonl(0x2); /* IPV6 Explicit Null. */
++        } else {
++             mpls_label = htonl(0x0); /* IPV4 Explicit Null. */
++        }
++        mpls_tc = htonl(((flow->nw_tos & IP_DSCP_MASK) >> 2) << MPLS_TC_SHIFT);
++        mpls_ttl = htonl(flow->nw_ttl << MPLS_TTL_SHIFT);
++        if (mpls_ttl == htonl(0)) {
++            mpls_ttl = htonl(0x40); /* Set default ttl for non-IP. */
++        }
++        mpls_stack = htonl(0x1 << MPLS_STACK_SHIFT);
++        flow->mpls_lse = mpls_label | mpls_tc | mpls_ttl | mpls_stack;
++    }
++
++    nl_msg_put_be16(odp_actions, OVS_ACTION_ATTR_PUSH_MPLS, eth_type);
++    base->dl_type = flow->dl_type = eth_type;
++}
++
++/* Handle MPLS Pop action. Update packet flow. */
++void
++commit_mpls_pop_action(const struct flow *flow, struct flow *base,
++                       struct ofpbuf *odp_actions)
++{
++    assert(!(flow->dl_type == htons(ETH_TYPE_MPLS) ||
++             flow->dl_type == htons(ETH_TYPE_MPLS_MCAST)));
++    nl_msg_put_be16(odp_actions, OVS_ACTION_ATTR_POP_MPLS, flow->dl_type);
++    base->dl_type = flow->dl_type;
++}
++
++/* Handle MPLS Label Stack Entry action. Update packet flow. */
++void
++commit_mpls_lse_action(const struct flow *flow, struct flow *base,
++                         struct ofpbuf *odp_actions)
++{
++    if (base->mpls_lse == flow->mpls_lse) {
++        return;
++    }
++
++    nl_msg_put_be32(odp_actions, OVS_ACTION_ATTR_SET_MPLS_LSE, flow->mpls_lse);
++    base->mpls_lse = flow->mpls_lse;
++}
++
+ static void
+ commit_set_nw_action(const struct flow *flow, struct flow *base,
+                      struct ofpbuf *odp_actions)
+diff --git a/lib/odp-util.h b/lib/odp-util.h
+index f902b76..db85c28 100644
+--- a/lib/odp-util.h
++++ b/lib/odp-util.h
+@@ -131,6 +131,12 @@ const char *odp_key_fitness_to_string(enum odp_key_fitness);
+ 
+ void commit_odp_actions(const struct flow *, struct flow *base,
+                         struct ofpbuf *odp_actions);
++void commit_mpls_push_action(struct flow *flow, struct flow *base,
++                             struct ofpbuf *odp_actions, ovs_be16 eth_type);
++void commit_mpls_pop_action(const struct flow *flow, struct flow *base,
++                             struct ofpbuf *odp_actions);
++void commit_mpls_lse_action(const struct flow *flow, struct flow *base,
++                              struct ofpbuf *odp_actions);
+ 
+ /* ofproto-dpif interface.
+  *
+diff --git a/lib/ofp-parse.c b/lib/ofp-parse.c
+index 73a70c6..7fcaf13 100644
+--- a/lib/ofp-parse.c
++++ b/lib/ofp-parse.c
+@@ -321,6 +321,11 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
+     struct ofp_action_vlan_vid *oavv;
+     struct ofp_action_nw_addr *oana;
+     struct ofp_action_tp_port *oata;
++    struct nx_action_mpls_label *naml;
++    struct nx_action_mpls_tc *namtc;
++    struct nx_action_mpls_ttl *namttl;
++    struct nx_action_push_mpls *nampush;
++    struct nx_action_pop_mpls *nampop;
+ 
+     switch (code) {
+     case OFPUTIL_OFPAT10_OUTPUT:
+@@ -423,6 +428,43 @@ parse_named_action(enum ofputil_action_code code, const struct flow *flow,
+         learn_parse(b, arg, flow);
+         break;
+ 
++    case OFPUTIL_NXAST_COPY_TTL_OUT:
++        ofputil_put_NXAST_COPY_TTL_OUT(b);
++        break;
++
++    case OFPUTIL_NXAST_COPY_TTL_IN:
++        ofputil_put_NXAST_COPY_TTL_IN(b);
++        break;
++
++    case OFPUTIL_NXAST_SET_MPLS_LABEL:
++        naml = ofputil_put_NXAST_SET_MPLS_LABEL(b);
++        naml->mpls_label = htonl(str_to_u32(arg));
++        break;
++
++    case OFPUTIL_NXAST_SET_MPLS_TC:
++        namtc = ofputil_put_NXAST_SET_MPLS_TC(b);
++        namtc->mpls_tc = str_to_u32(arg);
++        break;
++
++    case OFPUTIL_NXAST_SET_MPLS_TTL:
++        namttl = ofputil_put_NXAST_SET_MPLS_TTL(b);
++        namttl->mpls_ttl = str_to_u32(arg);
++        break;
++
++    case OFPUTIL_NXAST_DEC_MPLS_TTL:
++        ofputil_put_NXAST_DEC_MPLS_TTL(b);
++        break;
++
++    case OFPUTIL_NXAST_PUSH_MPLS:
++        nampush = ofputil_put_NXAST_PUSH_MPLS(b);
++        nampush->ethertype = htons(str_to_u16(arg, "push_mpls"));
++        break;
++
++    case OFPUTIL_NXAST_POP_MPLS:
++        nampop = ofputil_put_NXAST_POP_MPLS(b);
++        nampop->ethertype = htons(str_to_u16(arg, "pop_mpls"));
++        break;
++
+     case OFPUTIL_NXAST_EXIT:
+         ofputil_put_NXAST_EXIT(b);
+         break;
+@@ -496,6 +538,8 @@ parse_protocol(const char *name, const struct protocol **p_out)
+         { "icmp6", ETH_TYPE_IPV6, IPPROTO_ICMPV6 },
+         { "tcp6", ETH_TYPE_IPV6, IPPROTO_TCP },
+         { "udp6", ETH_TYPE_IPV6, IPPROTO_UDP },
++        { "mpls", ETH_TYPE_MPLS, 0 },
++        { "mplsm", ETH_TYPE_MPLS_MCAST, 0 },
+     };
+     const struct protocol *p;
+ 
+diff --git a/lib/ofp-print.c b/lib/ofp-print.c
+index 9f77c5a..281e427 100644
+--- a/lib/ofp-print.c
++++ b/lib/ofp-print.c
+@@ -168,6 +168,11 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
+ {
+     const struct ofp_action_enqueue *oae;
+     const struct ofp_action_dl_addr *oada;
++    const struct nx_action_mpls_label *naml;
++    const struct nx_action_push_mpls *nampush;
++    const struct nx_action_pop_mpls  *nampop;
++    const struct nx_action_mpls_tc  *namtc;
++    const struct nx_action_mpls_ttl  *namttl;
+     const struct nx_action_set_tunnel64 *nast64;
+     const struct nx_action_set_tunnel *nast;
+     const struct nx_action_set_queue *nasq;
+@@ -337,6 +342,43 @@ ofp_print_action(struct ds *s, const union ofp_action *a,
+         ds_put_cstr(s, "dec_ttl");
+         break;
+ 
++    case OFPUTIL_NXAST_SET_MPLS_LABEL:
++        naml = (const struct nx_action_mpls_label *) a;
++        ds_put_format(s, "set_mpls_label:%"PRIu32, ntohl(naml->mpls_label));
++        break;
++
++    case OFPUTIL_NXAST_SET_MPLS_TC:
++        namtc = (const struct nx_action_mpls_tc *) a;
++        ds_put_format(s, "set_mpls_tc:%"PRIu8, namtc->mpls_tc);
++        break;
++
++    case OFPUTIL_NXAST_SET_MPLS_TTL:
++        namttl = (const struct nx_action_mpls_ttl *) a;
++        ds_put_format(s, "set_mpls_ttl:%"PRIu8, namttl->mpls_ttl);
++        break;
++
++    case OFPUTIL_NXAST_DEC_MPLS_TTL:
++        ds_put_cstr(s, "dec_mpls_ttl");
++        break;
++
++    case OFPUTIL_NXAST_COPY_TTL_IN:
++        ds_put_cstr(s, "copy_ttl_in");
++        break;
++
++    case OFPUTIL_NXAST_COPY_TTL_OUT:
++        ds_put_cstr(s, "copy_ttl_out");
++        break;
++
++   case OFPUTIL_NXAST_PUSH_MPLS:
++        nampush = (const struct nx_action_push_mpls *) a;
++        ds_put_format(s, "push_mpls:0x%"PRIx16, ntohs(nampush->ethertype));
++        break;
++
++    case OFPUTIL_NXAST_POP_MPLS:
++        nampop = (const struct nx_action_pop_mpls *) a;
++        ds_put_format(s, "pop_mpls:0x%"PRIx16, ntohs(nampop->ethertype));
++        break;
++
+     case OFPUTIL_NXAST_EXIT:
+         ds_put_cstr(s, "exit");
+         break;
+@@ -861,6 +903,10 @@ ofp10_match_to_string(const struct ofp10_match *om, int verbosity)
+             }
+         } else if (om->dl_type == htons(ETH_TYPE_ARP)) {
+             ds_put_cstr(&f, "arp,");
++        } else if (om->dl_type == htons(ETH_TYPE_MPLS)) {
++            ds_put_cstr(&f, "mpls,");
++        } else if (om->dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++            ds_put_cstr(&f, "mplsm,");
+         } else {
+             skip_type = false;
+         }
+diff --git a/lib/ofp-util.c b/lib/ofp-util.c
+index 6d820b2..f148f99 100644
+--- a/lib/ofp-util.c
++++ b/lib/ofp-util.c
+@@ -103,7 +103,7 @@ static const flow_wildcards_t WC_INVARIANTS = 0
+ void
+ ofputil_wildcard_from_ofpfw10(uint32_t ofpfw, struct flow_wildcards *wc)
+ {
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     /* Initialize most of rule->wc. */
+     flow_wildcards_init_catchall(wc);
+@@ -111,7 +111,8 @@ ofputil_wildcard_from_ofpfw10(uint32_t ofpfw, struct flow_wildcards *wc)
+ 
+     /* Wildcard fields that aren't defined by ofp10_match or tun_id. */
+     wc->wildcards |= (FWW_ARP_SHA | FWW_ARP_THA | FWW_NW_ECN | FWW_NW_TTL
+-                      | FWW_IPV6_LABEL);
++                      | FWW_IPV6_LABEL | FWW_MPLS_LABEL | FWW_MPLS_TC
++                      | FWW_MPLS_STACK);
+ 
+     if (ofpfw & OFPFW10_NW_TOS) {
+         /* OpenFlow 1.0 defines a TOS wildcard, but it's much later in
+@@ -1442,7 +1443,7 @@ ofputil_usable_protocols(const struct cls_rule *rule)
+ {
+     const struct flow_wildcards *wc = &rule->wc;
+ 
+-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 11);
++    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 12);
+ 
+     /* NXM and OF1.1+ supports bitwise matching on ethernet addresses. */
+     if (!eth_mask_is_exact(wc->dl_src_mask)
+@@ -1506,6 +1507,21 @@ ofputil_usable_protocols(const struct cls_rule *rule)
+         return OFPUTIL_P_NXM_ANY;
+     }
+ 
++    /* Only NXM supports matching mpls label */
++    if (!(wc->wildcards & FWW_MPLS_LABEL)) {
++        return OFPUTIL_P_NXM_ANY;
++    }
++
++    /* Only NXM supports matching mpls tc */
++    if (!(wc->wildcards & FWW_MPLS_TC)) {
++        return OFPUTIL_P_NXM_ANY;
++    }
++
++    /* Only NXM supports matching mpls stack */
++    if (!(wc->wildcards & FWW_MPLS_STACK)) {
++        return OFPUTIL_P_NXM_ANY;
++    }
++
+     /* Other formats can express this rule. */
+     return OFPUTIL_P_ANY;
+ }
+@@ -3687,6 +3703,9 @@ validate_actions(const union ofp_action *actions, size_t n_actions,
+         enum ofperr error;
+         uint16_t port;
+         int code;
++        ovs_be16 etype;
++        ovs_be32 mpls_label;
++        uint8_t mpls_tc, mpls_ttl;
+ 
+         code = ofputil_decode_action(a);
+         if (code < 0) {
+@@ -3717,6 +3736,43 @@ validate_actions(const union ofp_action *actions, size_t n_actions,
+             }
+             break;
+ 
++        case OFPUTIL_NXAST_PUSH_MPLS:
++            etype = ((const struct nx_action_push_mpls *) a)->ethertype;
++            if (etype != htons(ETH_TYPE_MPLS) &&
++                etype != htons(ETH_TYPE_MPLS_MCAST)) {
++                error = OFPERR_OFPBAC_BAD_ARGUMENT;
++            }
++            break;
++
++        case OFPUTIL_NXAST_POP_MPLS:
++            etype = ((const struct nx_action_pop_mpls *) a)->ethertype;
++            if (etype == htons(ETH_TYPE_MPLS) ||
++                etype == htons(ETH_TYPE_MPLS_MCAST)) {
++                error = OFPERR_OFPBAC_BAD_ARGUMENT;
++            }
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_LABEL:
++            mpls_label = ((const struct nx_action_mpls_label *) a)->mpls_label;
++            if (mpls_label & ~htonl(0x000fffff)) {
++                error = OFPERR_OFPBAC_BAD_ARGUMENT;
++            }
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_TC:
++            mpls_tc = ((const struct nx_action_mpls_tc *) a)->mpls_tc;
++            if (mpls_tc & ~7) {
++                error = OFPERR_OFPBAC_BAD_ARGUMENT;
++            }
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_TTL:
++            mpls_ttl = ((const struct nx_action_mpls_ttl *) a)->mpls_ttl;
++            if (mpls_ttl == 0 || mpls_ttl == 1) {
++                error = OFPERR_OFPBAC_BAD_ARGUMENT;
++            }
++            break;
++
+         case OFPUTIL_OFPAT10_ENQUEUE:
+             port = ntohs(((const struct ofp_action_enqueue *) a)->port);
+             if (port >= max_ports && port != OFPP_IN_PORT
+@@ -3788,6 +3844,9 @@ validate_actions(const union ofp_action *actions, size_t n_actions,
+         case OFPUTIL_NXAST_EXIT:
+         case OFPUTIL_NXAST_DEC_TTL:
+         case OFPUTIL_NXAST_FIN_TIMEOUT:
++        case OFPUTIL_NXAST_COPY_TTL_OUT:
++        case OFPUTIL_NXAST_COPY_TTL_IN:
++        case OFPUTIL_NXAST_DEC_MPLS_TTL:
+             break;
+         }
+ 
+@@ -4041,7 +4100,8 @@ ofputil_normalize_rule(struct cls_rule *rule)
+         MAY_ARP_SHA     = 1 << 4, /* arp_sha */
+         MAY_ARP_THA     = 1 << 5, /* arp_tha */
+         MAY_IPV6        = 1 << 6, /* ipv6_src, ipv6_dst, ipv6_label */
+-        MAY_ND_TARGET   = 1 << 7  /* nd_target */
++        MAY_ND_TARGET   = 1 << 7, /* nd_target */
++        MAY_MPLS        = 1 << 8, /* mpls label and tc */
+     } may_match;
+ 
+     struct flow_wildcards wc;
+@@ -4069,6 +4129,9 @@ ofputil_normalize_rule(struct cls_rule *rule)
+         }
+     } else if (rule->flow.dl_type == htons(ETH_TYPE_ARP)) {
+         may_match = MAY_NW_PROTO | MAY_NW_ADDR | MAY_ARP_SHA | MAY_ARP_THA;
++    } else if (rule->flow.dl_type == htons(ETH_TYPE_MPLS) ||
++               rule->flow.dl_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        may_match = MAY_MPLS;
+     } else {
+         may_match = 0;
+     }
+@@ -4102,6 +4165,11 @@ ofputil_normalize_rule(struct cls_rule *rule)
+     if (!(may_match & MAY_ND_TARGET)) {
+         wc.nd_target_mask = in6addr_any;
+     }
++    if (!(may_match & MAY_MPLS)) {
++        wc.wildcards |= FWW_MPLS_LABEL;
++        wc.wildcards |= FWW_MPLS_TC;
++        wc.wildcards |= FWW_MPLS_STACK;
++    }
+ 
+     /* Log any changes. */
+     if (!flow_wildcards_equal(&wc, &rule->wc)) {
+diff --git a/lib/ofp-util.def b/lib/ofp-util.def
+index 8739ac0..0380a84 100644
+--- a/lib/ofp-util.def
++++ b/lib/ofp-util.def
+@@ -39,4 +39,12 @@ NXAST_ACTION(NXAST_EXIT,           nx_action_header,       0, "exit")
+ NXAST_ACTION(NXAST_DEC_TTL,        nx_action_header,       0, "dec_ttl")
+ NXAST_ACTION(NXAST_FIN_TIMEOUT,    nx_action_fin_timeout,  0, "fin_timeout")
+ NXAST_ACTION(NXAST_CONTROLLER,     nx_action_controller,   0, "controller")
++NXAST_ACTION(NXAST_COPY_TTL_OUT,   nx_action_header,       0, "copy_ttl_out")
++NXAST_ACTION(NXAST_COPY_TTL_IN,    nx_action_header,       0, "copy_ttl_in")
++NXAST_ACTION(NXAST_SET_MPLS_LABEL, nx_action_mpls_label,   0, "set_mpls_label")
++NXAST_ACTION(NXAST_SET_MPLS_TC,    nx_action_mpls_tc,      0, "set_mpls_tc")
++NXAST_ACTION(NXAST_SET_MPLS_TTL,   nx_action_mpls_ttl,     0, "set_mpls_ttl")
++NXAST_ACTION(NXAST_DEC_MPLS_TTL,   nx_action_header,       0, "dec_mpls_ttl")
++NXAST_ACTION(NXAST_PUSH_MPLS,      nx_action_push_mpls,    0, "push_mpls")
++NXAST_ACTION(NXAST_POP_MPLS,       nx_action_pop_mpls,     0, "pop_mpls")
+ #undef NXAST_ACTION
+diff --git a/lib/ofpbuf.c b/lib/ofpbuf.c
+index 02e5aa8..a850d1b 100644
+--- a/lib/ofpbuf.c
++++ b/lib/ofpbuf.c
+@@ -30,7 +30,7 @@ ofpbuf_use__(struct ofpbuf *b, void *base, size_t allocated,
+     b->allocated = allocated;
+     b->source = source;
+     b->size = 0;
+-    b->l2 = b->l3 = b->l4 = b->l7 = NULL;
++    b->l2 = b->l2_5 = b->l3 = b->l4 = b->l7 = NULL;
+     list_poison(&b->list_node);
+     b->private_p = NULL;
+ }
+@@ -177,6 +177,9 @@ ofpbuf_clone_with_headroom(const struct ofpbuf *buffer, size_t headroom)
+     if (buffer->l2) {
+         new_buffer->l2 = (char *) buffer->l2 + data_delta;
+     }
++    if (buffer->l2_5) {
++        new_buffer->l2_5 = (char *) buffer->l2_5 + data_delta;
++    }
+     if (buffer->l3) {
+         new_buffer->l3 = (char *) buffer->l3 + data_delta;
+     }
+@@ -296,6 +299,9 @@ ofpbuf_resize__(struct ofpbuf *b, size_t new_headroom, size_t new_tailroom)
+         if (b->l2) {
+             b->l2 = (char *) b->l2 + data_delta;
+         }
++        if (b->l2_5) {
++            b->l2_5 = (char *) b->l2_5 + data_delta;
++        }
+         if (b->l3) {
+             b->l3 = (char *) b->l3 + data_delta;
+         }
+diff --git a/lib/ofpbuf.h b/lib/ofpbuf.h
+index 520455d..bae3c0a 100644
+--- a/lib/ofpbuf.h
++++ b/lib/ofpbuf.h
+@@ -43,6 +43,7 @@ struct ofpbuf {
+     size_t size;                /* Number of bytes in use. */
+ 
+     void *l2;                   /* Link-level header. */
++    void *l2_5;                 /* MPLS label stack */
+     void *l3;                   /* Network-level header. */
+     void *l4;                   /* Transport-level header. */
+     void *l7;                   /* Application data. */
+diff --git a/lib/packets.c b/lib/packets.c
+index 5729167..3ccad03 100644
+--- a/lib/packets.c
++++ b/lib/packets.c
+@@ -20,6 +20,7 @@
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <netinet/in.h>
++#include <netinet/ip6.h>
+ #include <stdlib.h>
+ #include "byte-order.h"
+ #include "csum.h"
+@@ -198,6 +199,357 @@ eth_pop_vlan(struct ofpbuf *packet)
+     }
+ }
+ 
++/* Set ethertype of the packet. */
++static void
++set_ethertype(struct ofpbuf *packet, ovs_be16 eth_type)
++{
++    struct eth_header *eh = packet->data;
++
++    if (eh->eth_type == htons(ETH_TYPE_VLAN)) {
++        /* ethtype for VLAN packets is at L3_offset - 2 bytes. */
++        ovs_be16 *next_ethtype;
++        next_ethtype = (ovs_be16 *)((char *)packet->l3 - 2);
++        *next_ethtype = eth_type;
++    } else {
++        eh->eth_type = eth_type;
++    }
++}
++
++/* Get ethertype of the packet. */
++static ovs_be16
++get_ethertype(struct ofpbuf *packet)
++{
++    struct eth_header *eh = packet->data;
++    char *mh = packet->l2_5;
++    ovs_be16 *ethtype = NULL;
++
++    if (eh->eth_type == htons(ETH_TYPE_VLAN)) {
++        if (mh != NULL) {
++            ethtype = (ovs_be16 *)(mh - 2);
++        } else {
++            ethtype = (ovs_be16 *)((char *)packet->l3 - 2);
++        }
++        return *ethtype;
++    } else {
++        return eh->eth_type;
++    }
++}
++
++/* Extract ttl and tos from ipv4 or ipv6 header
++   for non-IP pick default value. */
++static int
++get_label_ttl_and_tos(struct ofpbuf* packet, uint8_t *ttl,
++                      uint8_t *tos, uint8_t *label)
++{
++    struct eth_header *eh = packet->data;
++    struct ip_header *ih = packet->l3;
++    struct ip6_hdr   *ih6 = packet->l3;
++    struct mpls_hdr *mh = packet->l2_5;
++    ovs_be16 ethtype = htons(0);
++
++    if (packet->size < sizeof *eh + sizeof *ih) {
++        return 0;
++    }
++
++    ethtype = get_ethertype(packet);
++
++    switch (ntohs(ethtype)) {
++
++    case ETH_TYPE_IP:
++        *ttl = ih->ip_ttl;
++        *tos = IP_DSCP(ih->ip_tos) & 0x07;
++        *label = 0; /* IPV4 Explicit Null label. */
++	break;
++
++    case ETH_TYPE_IPV6:
++        *ttl = ih6->ip6_hlim;
++        *tos = IP6_TC(ntohl(ih6->ip6_flow)) & 0x07;
++        *label = 2; /* IPV6 Explicit Null label. */
++	break;
++
++    case ETH_TYPE_MPLS:
++    case ETH_TYPE_MPLS_MCAST:
++        *ttl = mpls_lse_to_ttl(mh->mpls_lse);
++        *tos = mpls_lse_to_tc(mh->mpls_lse);
++        *label = mpls_lse_to_label(mh->mpls_lse);
++	break;
++
++    default:
++        *ttl = 64;
++        *tos = 0;
++        *label = 0; /* default label. */
++	break;
++    }
++    return 1;
++}
++
++/* Set MPLS tag time-to-live. */
++static void
++set_mpls_lse_ttl(ovs_be32 *tag, ovs_be32 ttl)
++{
++    *tag &= ~htonl(MPLS_TTL_MASK);
++    *tag |= ttl & htonl(MPLS_TTL_MASK);
++}
++
++/* Set MPLS tag traffic-class. */
++static void
++set_mpls_lse_tc(ovs_be32 *tag, ovs_be32 tc)
++{
++    *tag &= ~htonl(MPLS_TC_MASK);
++    *tag |= tc & htonl(MPLS_TC_MASK);
++}
++
++/* Set MPLS tag label. */
++static void
++set_mpls_lse_label(ovs_be32 *tag, ovs_be32 label)
++{
++    *tag &= ~htonl(MPLS_LABEL_MASK);
++    *tag |= label & htonl(MPLS_LABEL_MASK);
++}
++
++/* Set MPLS tag stack. */
++static void
++set_mpls_lse_stack(ovs_be32 *tag, ovs_be32 stack)
++{
++    *tag &= ~htonl(MPLS_STACK_MASK);
++    *tag |= stack & htonl(MPLS_STACK_MASK);
++}
++
++/* Set MPLS lse from actions. */
++static void
++set_new_mpls_lse(struct mpls_hdr *mh, ovs_be32 mpls_lse)
++{
++    set_mpls_lse_label(&mh->mpls_lse, mpls_lse);
++    set_mpls_lse_ttl(&mh->mpls_lse, mpls_lse);
++    set_mpls_lse_tc(&mh->mpls_lse, mpls_lse);
++}
++
++/* Set MPLS label, MPLS TC, MPLS ttl and MPLS stack. */
++static void
++set_mpls_lse_values(ovs_be32 *tag, uint8_t ttl, uint8_t stack,
++                    uint8_t tc, uint32_t label)
++{
++    set_mpls_lse_ttl(tag, htonl(ttl << MPLS_TTL_SHIFT));
++    set_mpls_lse_tc(tag, htonl(tc << MPLS_TC_SHIFT));
++    set_mpls_lse_label(tag, htonl(label << MPLS_LABEL_SHIFT));
++    set_mpls_lse_stack(tag, htonl(stack << MPLS_STACK_SHIFT));
++}
++
++/* Adjust L2 and L2.5 data after pushing new mpls shim header. */
++static void
++push_mpls_lse(struct ofpbuf *packet, struct mpls_hdr *mh)
++{
++    char * header;
++    size_t len;
++    header = ofpbuf_push_uninit(packet, MPLS_HLEN);
++    len = (char*)packet->l2_5 - (char*)packet->l2;
++    memmove(header, packet->l2, len);
++    memcpy((char*)header + len, mh, sizeof *mh);
++    packet->l2 = (char*)packet->l2 - MPLS_HLEN;
++    packet->l2_5 = (char*)packet->l2_5 - MPLS_HLEN;
++}
++
++/* Decrement MPLS TTL from the packet.
++ * 'packet->l2_5' must initially point to 'packet''s MPLS Label stack. */
++void
++dec_mpls_ttl(struct ofpbuf *packet)
++{
++    ovs_be16 eth_type = htons(0);
++    struct eth_header *eh = packet->data;
++    struct mpls_hdr *mh = packet->l2_5;
++
++    if (packet->size < sizeof *eh) {
++        return;
++    }
++
++    /* Packet type should be mpls to decrement ttl. */
++    eth_type = get_ethertype(packet);
++
++    if (eth_type == htons(ETH_TYPE_MPLS) ||
++        eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++
++        uint8_t ttl = mpls_lse_to_ttl(mh->mpls_lse);
++        if (ttl > 1) {
++            set_mpls_lse_ttl(&mh->mpls_lse, htonl(--ttl << MPLS_TTL_SHIFT));
++        }
++    }
++}
++
++/* Copy MPLS TTL from the packet either ipv4/ipv6.
++ * 'packet->l2_5' must initially point to 'packet''s MPLS Label stack. */
++void
++copy_mpls_ttl_in(struct ofpbuf *packet)
++{
++    uint8_t ttl;
++    struct eth_header *eh = packet->data;
++    struct mpls_hdr *mh = packet->l2_5;
++    struct ip_header *ih = packet->l3;
++    struct ip6_hdr *ih6 = packet->l3;
++    ovs_be16 eth_type = htons(0);
++    size_t hdr_size = sizeof *eh + sizeof *mh + sizeof *ih;
++
++    if (packet->size < hdr_size) {
++        return;
++    }
++
++    /* Packet type should be mpls to copy ttl to l3. */
++    eth_type = get_ethertype(packet);
++    if (eth_type == htons(ETH_TYPE_MPLS) ||
++        eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++
++        ttl = mpls_lse_to_ttl(mh->mpls_lse);
++        /* If bottom of the stack handle IP checksum. */
++        if (mh->mpls_lse & htonl(MPLS_STACK_MASK)) {
++            if (IP_VER(ih->ip_ihl_ver) == IP_VERSION) {
++                /* Change the ip checksum. */
++                uint8_t *field = &ih->ip_ttl;
++                ih->ip_csum = recalc_csum16(ih->ip_csum,
++                                 htons(*field << 8), htons(ttl << 8));
++                ih->ip_ttl = ttl;
++            } else if (IP6_VER(ih6->ip6_vfc) == IP6_VERSION) {
++                ih6->ip6_hlim = ttl;
++            }
++        } else {
++            struct mpls_hdr *mh2;
++            mh2 = (struct mpls_hdr *)((char *) packet->l2_5 + sizeof *mh);
++            set_mpls_lse_ttl(&mh2->mpls_lse, htonl(ttl << MPLS_TTL_SHIFT));
++        }
++    }
++}
++
++/* Copy MPLS TTL to the packet layer3 only ipv4/ipv6.
++ * 'packet->l2_5' must initially point to 'packet''s MPLS Label stack. */
++void
++copy_mpls_ttl_out(struct ofpbuf *packet)
++{
++    struct eth_header *eh = packet->data;
++    struct mpls_hdr *mh = packet->l2_5;
++    struct ip_header *ih = packet->l3;
++    struct ip6_hdr   *ih6 = packet->l3;
++    ovs_be16 eth_type = htons(0);
++    size_t hdr_size = sizeof *eh + sizeof *mh + sizeof *ih;
++
++    if (packet->size < hdr_size) {
++        return;
++    }
++
++    /* Packet type should me mpls to copy ttl from l3. */
++    eth_type = get_ethertype(packet);
++    if (eth_type == htons(ETH_TYPE_MPLS) ||
++        eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++
++        /* If bottom of the stack copy from l3. */
++        if (mh->mpls_lse & htonl(MPLS_STACK_MASK)) {
++            uint8_t nh_ttl;
++            /* Get ipv4 or ipv6 or default ttl. */
++            if (IP_VER(ih->ip_ihl_ver) == IP_VERSION) {
++                nh_ttl = ih->ip_ttl;
++            } else if (IP6_VER(ih6->ip6_vfc) == IP6_VERSION) {
++                nh_ttl = ih6->ip6_hlim;
++            } else {
++                nh_ttl = 64; /* Default ttl for non-IP. */
++            }
++            set_mpls_lse_ttl(&mh->mpls_lse, htonl(nh_ttl << MPLS_TTL_SHIFT));
++        } else {
++            struct mpls_hdr *mh2;
++            uint8_t ttl;
++            mh2 = (struct mpls_hdr *)((char *) packet->l2_5 + sizeof *mh);
++            ttl = mpls_lse_to_ttl(mh2->mpls_lse);
++            set_mpls_lse_ttl(&mh->mpls_lse, htonl(ttl << MPLS_TTL_SHIFT));
++        }
++    }
++    return;
++}
++
++/* Set MPLS label stack entry to outermost MPLS header.*/
++void
++set_mpls_lse(struct ofpbuf *packet, ovs_be32 mpls_lse)
++{
++    struct eth_header *eh = packet->data;
++    struct mpls_hdr *mh = packet->l2_5;
++    ovs_be16 eth_type = htons(0);
++
++    if (packet->size < sizeof *eh) {
++        return;
++    }
++
++    /* Packet type should me mpls to set label stack entry. */
++    eth_type = get_ethertype(packet);
++    if (eth_type == htons(ETH_TYPE_MPLS) ||
++        eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        set_new_mpls_lse(mh, mpls_lse);
++    }
++}
++
++/* Push MPLS label stack entry onto packet. */
++void
++push_mpls(struct ofpbuf *packet, ovs_be16 ethtype)
++{
++    struct eth_header *eh = packet->data;
++    uint8_t nh_ttl, nh_tos, label;
++    ovs_be16 eth_type = htons(0);
++
++    if (packet->size < sizeof *eh ||
++        (ethtype != htons(ETH_TYPE_MPLS) &&
++         ethtype != htons(ETH_TYPE_MPLS_MCAST))) {
++        return;
++    }
++
++    /* Get the packet ether_type. */
++    eth_type = get_ethertype(packet);
++
++    /* Get Label, time-to-live and tos from L3 or L2.5. */
++    if (get_label_ttl_and_tos(packet, &nh_ttl, &nh_tos, &label)) {
++        struct mpls_hdr mh;
++
++        if (eth_type == htons(ETH_TYPE_MPLS) ||
++            eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++            set_mpls_lse_values(&mh.mpls_lse, nh_ttl, 0, nh_tos, label);
++        } else {
++            /* Set ethtype and mpls label stack entry. */
++            set_ethertype(packet, ethtype);
++            set_mpls_lse_values(&mh.mpls_lse, nh_ttl, 1, nh_tos, label);
++            packet->l2_5 = packet->l3;
++        }
++        /* Push new MPLS shim header onto packet. */
++        push_mpls_lse(packet, &mh);
++    }
++}
++
++/* Pop outermost MPLS label stack entry from packet. */
++void
++pop_mpls(struct ofpbuf *packet, ovs_be16 ethtype)
++{
++    struct eth_header *eh = packet->data;
++    struct mpls_hdr *mh = NULL;
++    ovs_be16 eth_type = htons(0);
++
++    if (packet->size < sizeof *eh + sizeof *mh)
++        return;
++
++    eth_type = get_ethertype(packet);
++
++    if (eth_type == htons(ETH_TYPE_MPLS) ||
++        eth_type == htons(ETH_TYPE_MPLS_MCAST)) {
++        size_t len;
++        mh = packet->l2_5;
++        len = (char*)packet->l2_5 - (char*)packet->l2;
++        /* If bottom of the stack set ethertype. */
++        if (mh->mpls_lse & htonl(MPLS_STACK_MASK)) {
++            packet->l3 = packet->l2_5;
++            packet->l2_5 = NULL;
++            set_ethertype(packet, ethtype);
++        } else {
++            packet->l2_5 = (char*)packet->l2_5 + MPLS_HLEN;
++        }
++        /* Shift the l2 header forward. */
++        memmove((char*)packet->data + MPLS_HLEN, packet->data, len);
++        packet->size -= MPLS_HLEN;
++        packet->data = (char*)packet->data + MPLS_HLEN;
++        packet->l2 = (char*)packet->l2 + MPLS_HLEN;
++    }
++}
++
+ /* Converts hex digits in 'hex' to an Ethernet packet in '*packetp'.  The
+  * caller must free '*packetp'.  On success, returns NULL.  On failure, returns
+  * an error message and stores NULL in '*packetp'. */
+diff --git a/lib/packets.h b/lib/packets.h
+index ad5631d..f536437 100644
+--- a/lib/packets.h
++++ b/lib/packets.h
+@@ -147,6 +147,15 @@ void eth_addr_bitand(const uint8_t src[ETH_ADDR_LEN],
+                      const uint8_t mask[ETH_ADDR_LEN],
+                      uint8_t dst[ETH_ADDR_LEN]);
+ 
++void set_mpls_ttl(struct ofpbuf *, uint8_t ttl);
++void dec_mpls_ttl(struct ofpbuf *);
++void copy_mpls_ttl_in(struct ofpbuf *);
++void copy_mpls_ttl_out(struct ofpbuf *);
++void set_mpls_tc(struct ofpbuf *, uint8_t tc);
++void set_mpls_lse(struct ofpbuf *, ovs_be32 label);
++void push_mpls (struct ofpbuf *packet, ovs_be16 ethtype);
++void pop_mpls(struct ofpbuf *, ovs_be16 ethtype);
++
+ /* Example:
+  *
+  * uint8_t mac[ETH_ADDR_LEN];
+@@ -289,6 +298,76 @@ struct vlan_eth_header {
+ } __attribute__((packed));
+ BUILD_ASSERT_DECL(VLAN_ETH_HEADER_LEN == sizeof(struct vlan_eth_header));
+ 
++/* MPLS related definitions */
++#define MPLS_TTL_MASK       0x000000ff
++#define MPLS_TTL_SHIFT      0
++
++#define MPLS_STACK_MASK     0x00000100
++#define MPLS_STACK_SHIFT    8
++
++#define MPLS_TC_MASK        0x00000e00
++#define MPLS_TC_SHIFT       9
++
++#define MPLS_LABEL_MASK     0xfffff000
++#define MPLS_LABEL_SHIFT    12
++
++#define MPLS_HLEN           4
++
++struct mpls_hdr {
++    ovs_be32 mpls_lse;
++};
++BUILD_ASSERT_DECL(MPLS_HLEN == sizeof(struct mpls_hdr));
++
++#define MPLS_ETH_HEADER_LEN (ETH_HEADER_LEN + MPLS_HLEN)
++struct mpls_eth_header {
++    uint8_t  eth_dst[ETH_ADDR_LEN];
++    uint8_t  eth_src[ETH_ADDR_LEN];
++    ovs_be16 eth_type;         /* htons(ETH_TYPE_MPLS) or
++                                  htons(ETH_TYPE_MPLS_MCAST). */
++    ovs_be32 mpls_lse;
++} __attribute__((packed));
++BUILD_ASSERT_DECL(MPLS_ETH_HEADER_LEN == sizeof(struct mpls_eth_header));
++
++/* Given a mpls label stack entry in network byte order
++ * return mpls label */
++static inline uint32_t
++mpls_lse_to_label(ovs_be32 mpls_lse)
++{
++    return (ntohl(mpls_lse) & MPLS_LABEL_MASK) >> MPLS_LABEL_SHIFT;
++}
++
++/* Given a mpls label stack entry in network byte order
++ * return mpls tc */
++static inline int
++mpls_lse_to_tc(ovs_be32 mpls_lse)
++{
++    return (ntohl(mpls_lse) & MPLS_TC_MASK) >> MPLS_TC_SHIFT;
++}
++
++/* Given a mpls label stack entry in network byte order
++ * return mpls ttl */
++static inline int
++mpls_lse_to_ttl(ovs_be32 mpls_lse)
++{
++    return (ntohl(mpls_lse) & MPLS_TTL_MASK) >> MPLS_TTL_SHIFT;
++}
++
++/* Set TTL in mpls lse. */
++static inline void
++flow_set_mpls_lse_ttl(ovs_be32 *mpls_lse, uint8_t ttl)
++{
++    *mpls_lse &= ~htonl(MPLS_TTL_MASK);
++    *mpls_lse |= htonl(ttl << MPLS_TTL_SHIFT);
++}
++
++/* Given a mpls label stack entry in network byte order
++ * return mpls stack */
++static inline int
++mpls_lse_to_stack(ovs_be32 mpls_lse)
++{
++    return (mpls_lse & htonl(MPLS_STACK_MASK)) != 0;
++}
++
+ /* The "(void) (ip)[0]" below has no effect on the value, since it's the first
+  * argument of a comma expression, but it makes sure that 'ip' is a pointer.
+  * This is useful since a common mistake is to pass an integer instead of a
+@@ -349,6 +428,8 @@ void ip_format_masked(ovs_be32 ip, ovs_be32 mask, struct ds *);
+ 
+ #define IP_VERSION 4
+ 
++#define IP_DSCP(ip_tos) ((ip_tos & IP_DSCP_MASK) >> 2)
++
+ #define IP_DONT_FRAGMENT  0x4000 /* Don't fragment. */
+ #define IP_MORE_FRAGMENTS 0x2000 /* More fragments. */
+ #define IP_FRAG_OFF_MASK  0x1fff /* Fragment offset. */
+@@ -448,6 +529,11 @@ BUILD_ASSERT_DECL(ARP_ETH_HEADER_LEN == sizeof(struct arp_eth_header));
+ /* The IPv6 flow label is in the lower 20 bits of the first 32-bit word. */
+ #define IPV6_LABEL_MASK 0x000fffff
+ 
++#define IP6_VERSION    6
++
++#define IP6_VER(ip6_vfc) ((ip6_vfc) >> 4)
++#define IP6_TC(ip6_flow) ((ip6_flow >> 20) & 0xff)
++
+ /* Example:
+  *
+  * char *string = "1 ::1 2";
+diff --git a/ofproto/ofproto-dpif.c b/ofproto/ofproto-dpif.c
+index 962df15..592d0b4 100644
+--- a/ofproto/ofproto-dpif.c
++++ b/ofproto/ofproto-dpif.c
+@@ -4861,6 +4861,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
+     const struct ofport_dpif *ofport = get_ofp_port(ctx->ofproto, ofp_port);
+     uint16_t odp_port = ofp_port_to_odp_port(ofp_port);
+     ovs_be16 flow_vlan_tci = ctx->flow.vlan_tci;
++    ovs_be32 flow_mpls_lse = ctx->flow.mpls_lse;
+     uint8_t flow_nw_tos = ctx->flow.nw_tos;
+     uint16_t out_port;
+ 
+@@ -4895,6 +4896,7 @@ compose_output_action__(struct action_xlate_ctx *ctx, uint16_t ofp_port,
+     ctx->sflow_n_outputs++;
+     ctx->nf_output_iface = ofp_port;
+     ctx->flow.vlan_tci = flow_vlan_tci;
++    ctx->flow.mpls_lse = flow_mpls_lse;
+     ctx->flow.nw_tos = flow_nw_tos;
+ }
+ 
+@@ -5037,6 +5039,11 @@ execute_controller_action(struct action_xlate_ctx *ctx, int len,
+             eth_push_vlan(packet, ctx->flow.vlan_tci);
+         }
+ 
++        if (ctx->flow.mpls_lse) {
++            push_mpls(packet, ctx->flow.dl_type);
++            set_mpls_lse(packet, ctx->flow.mpls_lse);
++        }
++
+         if (packet->l4) {
+             if (ctx->flow.dl_type == htons(ETH_TYPE_IP)) {
+                 packet_set_ipv4(packet, ctx->flow.nw_src, ctx->flow.nw_dst,
+@@ -5088,6 +5095,41 @@ compose_dec_ttl(struct action_xlate_ctx *ctx)
+     }
+ }
+ 
++static inline void
++compose_dec_mpls_ttl(struct action_xlate_ctx *ctx)
++{
++    uint8_t ttl = mpls_lse_to_ttl(ctx->flow.mpls_lse);
++    if (ttl > 1) {
++        if (ctx->flow.mpls_lse != htonl(0)) {
++            flow_set_mpls_lse_ttl(&ctx->flow.mpls_lse, --ttl);
++        }
++        if (ctx->base_flow.mpls_lse != htonl(0)) {
++            flow_set_mpls_lse_ttl(&ctx->base_flow.mpls_lse, --ttl);
++        }
++        nl_msg_put_flag(ctx->odp_actions, OVS_ACTION_ATTR_DEC_MPLS_TTL);
++    } else {
++        execute_controller_action(ctx, UINT16_MAX, OFPR_INVALID_TTL, 0);
++    }
++}
++
++static inline void
++compose_copy_mpls_ttl_in(struct action_xlate_ctx *ctx)
++{
++    nl_msg_put_flag(ctx->odp_actions, OVS_ACTION_ATTR_COPY_TTL_IN);
++}
++
++static inline void
++compose_copy_mpls_ttl_out(struct action_xlate_ctx *ctx)
++{
++    if (ctx->flow.mpls_lse != htonl(0)) {
++        flow_set_mpls_lse_ttl(&ctx->flow.mpls_lse, ctx->flow.nw_ttl);
++    }
++    if (ctx->base_flow.mpls_lse != htonl(0)) {
++        flow_set_mpls_lse_ttl(&ctx->base_flow.mpls_lse, ctx->flow.nw_ttl);
++    }
++    nl_msg_put_flag(ctx->odp_actions, OVS_ACTION_ATTR_COPY_TTL_OUT);
++}
++
+ static void
+ xlate_output_action__(struct action_xlate_ctx *ctx,
+                       uint16_t port, uint16_t max_len)
+@@ -5344,6 +5386,11 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
+     }
+     OFPUTIL_ACTION_FOR_EACH_UNSAFE (ia, left, in, n_in) {
+         const struct ofp_action_dl_addr *oada;
++        const struct nx_action_mpls_label *naml;
++        const struct nx_action_mpls_tc *namtc;
++        const struct nx_action_mpls_ttl *namttl;
++        const struct nx_action_push_mpls *nampush;
++        const struct nx_action_pop_mpls *nampop;
+         const struct nx_action_resubmit *nar;
+         const struct nx_action_set_tunnel *nast;
+         const struct nx_action_set_queue *nasq;
+@@ -5354,6 +5401,7 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
+         const struct nx_action_controller *nac;
+         enum ofputil_action_code code;
+         ovs_be64 tun_id;
++        ovs_be32 mpls_label;
+ 
+         if (ctx->exit) {
+             break;
+@@ -5504,6 +5552,55 @@ do_xlate_actions(const union ofp_action *in, size_t n_in,
+             }
+             break;
+ 
++        case OFPUTIL_NXAST_PUSH_MPLS:
++            nampush = (const struct nx_action_push_mpls *) ia;
++            commit_mpls_push_action(&ctx->flow, &ctx->base_flow, ctx->odp_actions,
++                                    nampush->ethertype);
++            break;
++
++        case OFPUTIL_NXAST_POP_MPLS:
++            nampop = (const struct nx_action_pop_mpls *) ia;
++            ctx->flow.dl_type = nampop->ethertype;
++            commit_mpls_pop_action(&ctx->flow, &ctx->base_flow, ctx->odp_actions);
++            if (ctx->flow.mpls_lse != htonl(0)) {
++                ctx->flow.mpls_lse = htonl(0);
++            }
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_LABEL:
++            naml = (const struct nx_action_mpls_label *) ia;
++            mpls_label = htonl((ntohl(naml->mpls_label) << MPLS_LABEL_SHIFT));
++            ctx->flow.mpls_lse &= ~htonl(MPLS_LABEL_MASK);
++            ctx->flow.mpls_lse |= mpls_label;
++            commit_mpls_lse_action(&ctx->flow, &ctx->base_flow, ctx->odp_actions);
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_TC:
++            namtc = (const struct nx_action_mpls_tc *) ia;
++            ctx->flow.mpls_lse &= ~htonl(MPLS_TC_MASK);
++            ctx->flow.mpls_lse |= htonl((namtc->mpls_tc << MPLS_TC_SHIFT));
++            commit_mpls_lse_action(&ctx->flow, &ctx->base_flow, ctx->odp_actions);
++            break;
++
++        case OFPUTIL_NXAST_SET_MPLS_TTL:
++            namttl = (const struct nx_action_mpls_ttl *) ia;
++            ctx->flow.mpls_lse &= ~htonl(MPLS_TTL_MASK);
++            ctx->flow.mpls_lse |= htonl((namttl->mpls_ttl << MPLS_TTL_SHIFT));
++            commit_mpls_lse_action(&ctx->flow, &ctx->base_flow, ctx->odp_actions);
++            break;
++
++        case OFPUTIL_NXAST_DEC_MPLS_TTL:
++            compose_dec_mpls_ttl(ctx);
++            break;
++
++        case OFPUTIL_NXAST_COPY_TTL_IN:
++            compose_copy_mpls_ttl_in(ctx);
++            break;
++
++        case OFPUTIL_NXAST_COPY_TTL_OUT:
++            compose_copy_mpls_ttl_out(ctx);
++            break;
++
+         case OFPUTIL_NXAST_EXIT:
+             ctx->exit = true;
+             break;
+diff --git a/tests/automake.mk b/tests/automake.mk
+index 81d2942..80adbda 100644
+--- a/tests/automake.mk
++++ b/tests/automake.mk
+@@ -100,6 +100,7 @@ lcov_wrappers = \
+ 	tests/lcov/test-csum \
+ 	tests/lcov/test-file_name \
+ 	tests/lcov/test-flows \
++	tests/lcov/test-mpls \
+ 	tests/lcov/test-hash \
+ 	tests/lcov/test-heap \
+ 	tests/lcov/test-hmap \
+@@ -158,6 +159,7 @@ valgrind_wrappers = \
+ 	tests/valgrind/test-csum \
+ 	tests/valgrind/test-file_name \
+ 	tests/valgrind/test-flows \
++	tests/valgrind/test-mpls \
+ 	tests/valgrind/test-hash \
+ 	tests/valgrind/test-heap \
+ 	tests/valgrind/test-hmap \
+@@ -245,6 +247,10 @@ tests_test_flows_SOURCES = tests/test-flows.c
+ tests_test_flows_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
+ dist_check_SCRIPTS = tests/flowgen.pl
+ 
++noinst_PROGRAMS += tests/test-mpls
++tests_test_mpls_SOURCES = tests/test-mpls.c
++tests_test_mpls_LDADD = lib/libopenvswitch.a $(SSL_LIBS)
++
+ noinst_PROGRAMS += tests/test-hash
+ tests_test_hash_SOURCES = tests/test-hash.c
+ tests_test_hash_LDADD = lib/libopenvswitch.a
+diff --git a/tests/odp.at b/tests/odp.at
+index 9617af2..f22bd69 100644
+--- a/tests/odp.at
++++ b/tests/odp.at
+@@ -24,6 +24,11 @@ in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x86dd),ipv
+ in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x86dd),ipv6(src=::1,dst=::2,label=0,proto=58,tclass=0,hlimit=128,frag=no),icmpv6(type=136,code=0),nd(target=::3,tll=00:0a:0b:0c:0d:0e)
+ in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x86dd),ipv6(src=::1,dst=::2,label=0,proto=58,tclass=0,hlimit=128,frag=no),icmpv6(type=136,code=0),nd(target=::3,sll=00:05:06:07:08:09,tll=00:0a:0b:0c:0d:0e)
+ in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x0806),arp(sip=1.2.3.4,tip=5.6.7.8,op=1,sha=00:0f:10:11:12:13,tha=00:14:15:16:17:18)
++in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x8847),mpls(label=100,tc=3,ttl=64,bos=1)
++in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x8847),mpls(label=100,tc=7,ttl=100,bos=1)
++in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x8847),mpls(label=100,tc=7,ttl=100,bos=0)
++in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x8848),mpls(label=1000,tc=4,ttl=200,bos=1)
++in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x8848),mpls(label=1000,tc=4,ttl=200,bos=0)
+ ])
+ 
+ (echo '# Valid forms without tun_id or VLAN header.'
+@@ -39,6 +44,14 @@ in_port(1),eth(src=00:01:02:03:04:05,dst=10:11:12:13:14:15),eth_type(0x0806),arp
+ s/$/)/' odp-base.txt
+ 
+  echo
++ echo '# Valid forms with MPLS header.'
++ sed 's/\(eth([[^)]]*)\),*/\1,eth_type(0x8847),mpls(label=100,tc=7,ttl=64,bos=1)' odp-base.txt
++
++ echo
++ echo '# Valid forms with MPLS multicast header.'
++ sed 's/\(eth([[^)]]*)\),*/\1,eth_type(0x8848),mpls(label=100,tc=7,ttl=64,bos=1)' odp-base.txt
++
++ echo
+  echo '# Valid forms with QoS priority.'
+  sed 's/^/priority(1234),/' odp-base.txt
+ 
+@@ -89,6 +102,13 @@ push_vlan(vid=12,pcp=0)
+ push_vlan(vid=13,pcp=5,cfi=0)
+ push_vlan(tpid=0x9100,vid=13,pcp=5)
+ push_vlan(tpid=0x9100,vid=13,pcp=5,cfi=0)
++push_mpls(eth_type=0x8847)
++push_mpls(eth_type=0x8848)
++mpls_lse(label=100,tc=3,ttl=64,bos=0)
++mpls_lse(label=101,tc=4,ttl=100,bos=1)
++dec_mpls_ttl
++copy_ttl_in
++copy_ttl_out
+ pop_vlan
+ sample(sample=9.7%,actions(1,2,3,push_vlan(vid=1,pcp=2)))
+ ])
+diff --git a/tests/ofp-print.at b/tests/ofp-print.at
+index b302dee..071ebd1 100644
+--- a/tests/ofp-print.at
++++ b/tests/ofp-print.at
+@@ -278,7 +278,7 @@ c0 a8 00 02 27 2f 00 00 78 50 cc 5b 57 af 42 1e \
+ 50 00 02 00 26 e8 00 00 00 00 00 00 00 00 \
+ "], [0], [dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=3 (via no_match) data_len=60 buffer=0x00000111
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:06) type:0800 proto:6 tos:0 ttl:64 ip(192.168.0.1->192.168.0.2) port(10031->0) tcp_csum:26e8
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:06) type:0800,mpls(0) proto:6 tos:0 ttl:64 ip(192.168.0.1->192.168.0.2) port(10031->0) tcp_csum:26e8
+ ])
+ AT_CLEANUP
+ 
+@@ -775,7 +775,7 @@ ff ff ff ff 00 40 01 07 00 00 00 00 00 00 00 09 \
+ 31 6d 00 00 00 00 00 00 00 00 \
+ "], [0], [dnl
+ NXT_PACKET_IN (xid=0x0): table_id=7 cookie=0x9 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
+ ])
+ AT_CLEANUP
+ 
+diff --git a/tests/ofproto-dpif.at b/tests/ofproto-dpif.at
+index 9c3e0dc..7936cf9 100644
+--- a/tests/ofproto-dpif.at
++++ b/tests/ofproto-dpif.at
+@@ -97,7 +97,7 @@ AT_CHECK([ovs-appctl ofproto/trace br0 'in_port(1),eth(src=50:54:00:00:00:05,dst
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ NXT_PACKET_IN (xid=0x0): table_id=1 total_len=42 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via invalid_ttl) data_len=42 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800 proto:1 tos:0 ttl:1 ip(192.168.0.1->192.168.0.2)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800,mpls(0) proto:1 tos:0 ttl:1 ip(192.168.0.1->192.168.0.2)
+ ])
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+@@ -249,6 +249,10 @@ cookie=0x6 table=4 in_port=83 actions=load:4->NXM_NX_REG3[[]],mod_nw_src:83.83.8
+ cookie=0x7 table=5 in_port=84 actions=load:5->NXM_NX_REG4[[]],load:6->NXM_NX_TUN_ID[[]],mod_nw_dst:84.84.84.84,controller,resubmit(85,6)
+ cookie=0x8 table=6 in_port=85 actions=mod_tp_src:85,controller,resubmit(86,7)
+ cookie=0x9 table=7 in_port=86 actions=mod_tp_dst:86,controller,controller
++cookie=0xa dl_src=40:44:44:44:44:44 actions=push_mpls:0x8847,set_mpls_label:10,set_mpls_tc:3,set_mpls_ttl:64,dec_mpls_ttl,controller
++cookie=0xb dl_src=50:55:55:55:55:55 actions=set_mpls_label:1000,set_mpls_ttl:200,copy_ttl_out,controller
++cookie=0xd dl_src=60:66:66:66:66:66 actions=pop_mpls:0x0800,controller
++cookie=0xc dl_src=70:77:77:77:77:77 actions=push_mpls:0x8848,set_mpls_label:1000,set_mpls_tc:7,set_mpls_ttl:250,controller
+ ])
+ AT_CHECK([ovs-ofctl add-flows br0 flows.txt])
+ 
+@@ -262,13 +266,13 @@ done
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via no_match) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via no_match) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via no_match) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:54:00:00:00:05->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->9) tcp_csum:0
+ ])
+ 
+ dnl Singleton controller action.
+@@ -281,13 +285,13 @@ done
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via action) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via action) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=60 in_port=1 (via action) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(10:11:11:11:11:11->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
+ ])
+ 
+ dnl Modified controller action.
+@@ -300,13 +304,89 @@ done
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=64 in_port=1 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=64 in_port=1 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
+ dnl
+ OFPT_PACKET_IN (xid=0x0): total_len=64 in_port=1 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:15,pcp:0) mac(30:33:33:33:33:33->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->10) tcp_csum:0
++])
++
++dnl Modified mpls controller action.
++AT_CHECK([ovs-ofctl monitor br0 65534 -P nxm --detach --pidfile 2> ofctl_monitor.log])
++
++for i in 1 2 3; do
++    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=40:44:44:44:44:44,dst=50:54:00:00:00:07),eth_type(0x0800),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)'
++done
++
++OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
++AT_CHECK([cat ofctl_monitor.log], [0], [dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xa total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=48 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(40:44:44:44:44:44->50:54:00:00:00:07) type:8847,mpls(label:10,tc:3,ttl:64,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xa total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=48 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(40:44:44:44:44:44->50:54:00:00:00:07) type:8847,mpls(label:10,tc:3,ttl:64,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xa total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(40:44:44:44:44:44->50:54:00:00:00:07) type:8847,mpls(label:10,tc:3,ttl:64,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++])
++
++dnl Modified mpls ttl action.
++AT_CHECK([ovs-ofctl monitor br0 65534 -P nxm --detach --pidfile 2> ofctl_monitor.log])
++
++for i in 1 2 3; do
++    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=50:55:55:55:55:55,dst=50:54:00:00:00:07),eth_type(0x8847),mpls(label=100,tc=7,ttl=64,bos=1),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)'
++done
++
++OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
++AT_CHECK([cat ofctl_monitor.log], [0], [dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xb total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:55:55:55:55:55->50:54:00:00:00:07) type:8847,mpls(label:1000,tc:7,ttl:200,bos:1),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xb total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:55:55:55:55:55->50:54:00:00:00:07) type:8847,mpls(label:1000,tc:7,ttl:200,bos:1),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xb total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(50:55:55:55:55:55->50:54:00:00:00:07) type:8847,mpls(label:1000,tc:7,ttl:200,bos:1),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)
++])
++
++dnl Modified mpls ipv6 controller action.
++AT_CHECK([ovs-ofctl monitor br0 65534 -P nxm --detach --pidfile 2> ofctl_monitor.log])
++
++for i in 1 2 3; do
++    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=70:77:77:77:77:77,dst=50:54:00:00:00:07),eth_type(0x86dd),ipv6(src=::1,dst=::2,label=0,proto=10,tclass=0x70,hlimit=128,frag=no)'
++done
++
++OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
++AT_CHECK([cat ofctl_monitor.log], [0], [dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xc total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(70:77:77:77:77:77->50:54:00:00:00:07) type:8848,mpls(label:1000,tc:7,ttl:250,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xc total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(70:77:77:77:77:77->50:54:00:00:00:07) type:8848,mpls(label:1000,tc:7,ttl:250,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xc total_len=68 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(70:77:77:77:77:77->50:54:00:00:00:07) type:8848,mpls(label:1000,tc:7,ttl:250,bos:1) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++])
++
++dnl Modified mpls pop action.
++AT_CHECK([ovs-ofctl monitor br0 65534 -P nxm --detach --pidfile 2> ofctl_monitor.log])
++
++for i in 1 2 3; do
++    ovs-appctl netdev-dummy/receive p1 'in_port(1),eth(src=60:66:66:66:66:66,dst=50:54:00:00:00:07),eth_type(0x8847),mpls(label=10,tc=3,ttl=100,bos=1),ipv4(src=192.168.0.1,dst=192.168.0.2,proto=6,tos=0,ttl=64,frag=no)'
++done
++
++OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
++AT_CHECK([cat ofctl_monitor.log], [0], [dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xd total_len=60 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0), mac(60:66:66:66:66:66->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xd total_len=60 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0), mac(60:66:66:66:66:66->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2)
++dnl
++NXT_PACKET_IN (xid=0x0): cookie=0xd total_len=60 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=68 (unbuffered)
++priority:0,tunnel:0,in_port:0000,tci(0), mac(60:66:66:66:66:66->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2)
+ ])
+ 
+ dnl Checksum TCP.
+@@ -319,31 +399,31 @@ done
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ NXT_PACKET_IN (xid=0x0): cookie=0x1 total_len=60 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=1 cookie=0x3 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=2 cookie=0x4 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->50:54:00:00:00:07) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->50:54:00:00:00:07) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=3 cookie=0x5 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) tcp_csum:0
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=4 cookie=0x6 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->192.168.0.2) port(8->11) tcp_csum:1a03
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->192.168.0.2) port(8->11) tcp_csum:1a03
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=5 cookie=0x7 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(8->11) tcp_csum:3205
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(8->11) tcp_csum:3205
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=6 cookie=0x8 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->11) tcp_csum:31b8
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->11) tcp_csum:31b8
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=7 cookie=0x9 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=7 cookie=0x9 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:6 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) tcp_csum:316d
+ ])
+ 
+ dnl Checksum UDP.
+@@ -356,31 +436,31 @@ done
+ OVS_WAIT_UNTIL([ovs-appctl -t ovs-ofctl exit])
+ AT_CHECK([cat ofctl_monitor.log], [0], [dnl
+ NXT_PACKET_IN (xid=0x0): cookie=0x1 total_len=60 in_port=1 tun_id=0x0 reg0=0x0 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=60 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800 proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
++priority:0,tunnel:0,in_port:0000,tci(0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=1 cookie=0x3 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x0 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800 proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(20:22:22:22:22:22->50:54:00:00:00:07) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=2 cookie=0x4 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x0 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->50:54:00:00:00:07) type:0800 proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->50:54:00:00:00:07) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=3 cookie=0x5 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x0 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(192.168.0.1->192.168.0.2) port(8->11) udp_csum:1234
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=4 cookie=0x6 total_len=64 in_port=1 tun_id=0x0 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x0 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(83.83.83.83->192.168.0.2) port(8->11) udp_csum:2c37
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(83.83.83.83->192.168.0.2) port(8->11) udp_csum:2c37
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=5 cookie=0x7 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(8->11) udp_csum:4439
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(8->11) udp_csum:4439
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=6 cookie=0x8 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->11) udp_csum:43ec
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->11) udp_csum:43ec
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=7 cookie=0x9 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) udp_csum:43a1
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) udp_csum:43a1
+ dnl
+ NXT_PACKET_IN (xid=0x0): table_id=7 cookie=0x9 total_len=64 in_port=1 tun_id=0x6 reg0=0x1 reg1=0x2 reg2=0x3 reg3=0x4 reg4=0x5 reg5=0x0 reg6=0x0 reg7=0x0 (via action) data_len=64 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800 proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) udp_csum:43a1
++priority:0,tunnel:0,in_port:0000,tci(vlan:80,pcp:0) mac(80:81:81:81:81:81->82:82:82:82:82:82) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(83.83.83.83->84.84.84.84) port(85->86) udp_csum:43a1
+ ])
+ 
+ AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | sort], [0], [dnl
+@@ -393,6 +473,10 @@ AT_CHECK([ovs-ofctl dump-flows br0 | ofctl_strip | sort], [0], [dnl
+  cookie=0x7, table=5, n_packets=2, n_bytes=120, in_port=84 actions=load:0x5->NXM_NX_REG4[[]],load:0x6->NXM_NX_TUN_ID[[]],mod_nw_dst:84.84.84.84,CONTROLLER:65535,resubmit(85,6)
+  cookie=0x8, table=6, n_packets=2, n_bytes=120, in_port=85 actions=mod_tp_src:85,CONTROLLER:65535,resubmit(86,7)
+  cookie=0x9, table=7, n_packets=2, n_bytes=120, in_port=86 actions=mod_tp_dst:86,CONTROLLER:65535,CONTROLLER:65535
++ cookie=0xa, n_packets=3, n_bytes=180, dl_src=40:44:44:44:44:44 actions=push_mpls:0x8847,set_mpls_label:10,set_mpls_tc:3,set_mpls_ttl:64,dec_mpls_ttl,CONTROLLER:65535
++ cookie=0xb, n_packets=3, n_bytes=180, dl_src=50:55:55:55:55:55 actions=set_mpls_label:1000,set_mpls_ttl:200,copy_ttl_out,CONTROLLER:65535
++ cookie=0xd, n_packets=3, n_bytes=180, dl_src=60:66:66:66:66:66 actions=pop_mpls:0x0800,CONTROLLER:65535
++ cookie=0xc, n_packets=3, n_bytes=180, dl_src=70:77:77:77:77:77 actions=push_mpls:0x8848,set_mpls_label:1000,set_mpls_tc:7,set_mpls_ttl:250,dec_mpls_ttl,CONTROLLER:65535
+  n_packets=3, n_bytes=180, dl_src=10:11:11:11:11:11 actions=CONTROLLER:65535
+ NXST_FLOW reply:
+ ])
+diff --git a/tests/ofproto.at b/tests/ofproto.at
+index dbe31c4..d1ea8a0 100644
+--- a/tests/ofproto.at
++++ b/tests/ofproto.at
+@@ -580,21 +580,21 @@ check_async () {
+     ovs-ofctl -v packet-out br0 none controller '0001020304050010203040501234'
+     if test X"$1" = X"OFPR_ACTION"; then shift;
+         echo >>expout "OFPT_PACKET_IN: total_len=14 in_port=NONE (via action) data_len=14 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234 proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)"
++priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234,mpls(0) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)"
+     fi
+ 
+     # OFPT_PACKET_IN, OFPR_NO_MATCH (controller_id=123)
+     ovs-ofctl -v packet-out br0 none 'controller(reason=no_match,id=123)' '0001020304050010203040501234'
+     if test X"$1" = X"OFPR_NO_MATCH"; then shift;
+         echo >>expout "OFPT_PACKET_IN: total_len=14 in_port=NONE (via no_match) data_len=14 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234 proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)"
++priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234,mpls(0) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)"
+     fi
+ 
+     # OFPT_PACKET_IN, OFPR_INVALID_TTL (controller_id=0)
+     ovs-ofctl packet-out br0 none dec_ttl '002583dfb4000026b98cb0f908004500003fb7e200000011339bac11370dac100002d7730035002b8f6d86fb0100000100000000000006626c702d7873066e696369726103636f6d00000f00'
+     if test X"$1" = X"OFPR_INVALID_TTL"; then shift;
+         echo >>expout "OFPT_PACKET_IN: total_len=76 in_port=NONE (via invalid_ttl) data_len=76 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(00:26:b9:8c:b0:f9->00:25:83:df:b4:00) type:0800 proto:17 tos:0 ttl:0 ip(172.17.55.13->172.16.0.2) port(55155->53) udp_csum:8f6d"
++priority:0,tunnel:0,in_port:0000,tci(0) mac(00:26:b9:8c:b0:f9->00:25:83:df:b4:00) type:0800,mpls(0) proto:17 tos:0 ttl:0 ip(172.17.55.13->172.16.0.2) port(55155->53) udp_csum:8f6d"
+     fi
+ 
+     # OFPT_PORT_STATUS, OFPPR_ADD
+@@ -692,9 +692,9 @@ ovs-appctl -t ovs-ofctl exit
+ 
+ AT_CHECK([sed 's/ (xid=0x[[0-9a-fA-F]]*)//' monitor.log], [0], [dnl
+ OFPT_PACKET_IN: total_len=14 in_port=NONE (via action) data_len=14 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234 proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:1234,mpls(0) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
+ OFPT_PACKET_IN: total_len=14 in_port=CONTROLLER (via action) data_len=14 (unbuffered)
+-priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:5678 proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
++priority:0,tunnel:0,in_port:0000,tci(0) mac(00:10:20:30:40:50->00:01:02:03:04:05) type:5678,mpls(0) proto:0 tos:0 ttl:0 ip(0.0.0.0->0.0.0.0)
+ OFPT_BARRIER_REPLY:
+ ])
+ 
+diff --git a/tests/test-mpls.c b/tests/test-mpls.c
+new file mode 100644
+index 0000000..169b26e
+--- /dev/null
++++ b/tests/test-mpls.c
+@@ -0,0 +1,288 @@
++/*
++ * Copyright (c) 2012 Nicira, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at:
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <features.h>
++#ifndef __aligned_u64
++#define __aligned_u64 __u64 __attribute__((aligned(8)))
++#endif
++#include <linux/if_packet.h>
++#include <linux/if_ether.h>
++#include <arpa/inet.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <net/if.h>
++#include "csum.h"
++#include "packets.h"
++
++#define PKT_LENGTH	     512
++#define ETH_DST_ADDR_OFF     0
++#define ETH_SRC_ADDR_OFF     ETH_DST_ADDR_OFF  + ETH_ALEN
++#define ETH_TYPE_ADDR_OFF    ETH_SRC_ADDR_OFF  + ETH_ALEN
++#define VLAN_TPID_ADDR_OFF   ETH_TYPE_ADDR_OFF
++#define VLAN_VID_ADDR_OFF    VLAN_TPID_ADDR_OFF + 2
++#define VLAN_TYPE_ADDR_OFF   VLAN_VID_ADDR_OFF + 2
++#define MPLS_HDR_ADDR_OFF    ETH_TYPE_ADDR_OFF + 2
++#define IP_HDR_ADDR_OFF      MPLS_HDR_ADDR_OFF + 4
++
++struct vlan_hdr {
++    uint16_t value;
++};
++
++static int
++create_sock (int proto)
++{
++    int sock_fd;
++
++    if ((sock_fd = socket(AF_PACKET, SOCK_RAW, proto)) == -1) {
++        perror("Error creating socket: ");
++        exit(-1);
++    }
++    return sock_fd;
++}
++
++static int
++bind_sock (char *device, int sock_fd, int protocol)
++{
++
++    struct sockaddr_ll sll;
++    struct ifreq ifr;
++    bzero(&sll, sizeof(sll));
++    bzero(&ifr, sizeof(ifr));
++
++    /* First Get the Interface Index  */
++    strncpy((char *)ifr.ifr_name, device, IFNAMSIZ);
++    if ((ioctl(sock_fd, SIOCGIFINDEX, &ifr)) == -1) {
++        printf("Error getting Interface index !\n");
++        exit(-1);
++    }
++
++    /* Bind socket to this interface */
++    sll.sll_family = AF_PACKET;
++    sll.sll_ifindex = ifr.ifr_ifindex;
++    sll.sll_protocol = htons(protocol);
++
++    if ((bind(sock_fd, (struct sockaddr *)&sll, sizeof(sll)))== -1) {
++        perror("Error binding socket to interface\n");
++        exit(-1);
++    }
++
++    return 1;
++}
++
++static int
++send_pkt (int sock_fd, uint8_t *pkt, int pkt_len)
++{
++    int sent = 0;
++
++    /* A simple write on the socket ..thats all it takes ! */
++
++    if ((sent = write(sock_fd, pkt, pkt_len)) != pkt_len) {
++        return 0;
++    }
++    return 1;
++}
++
++static void
++write_ether_type (uint8_t *pkt, uint16_t eth_type)
++{
++    ovs_be16 tmp_eth_type;
++    tmp_eth_type = htons(eth_type);
++    memcpy((void*)pkt, (void*)&tmp_eth_type, 2);
++}
++
++static void
++write_ether_hdr (uint8_t *pkt, uint16_t eth_type)
++{
++    ovs_be16 tmp_eth_type;
++    /*MAC address of the host*/
++    uint8_t src_mac[ETH_ALEN] = {0x00, 0x27, 0x13, 0x67, 0xb9, 0x9b};
++
++    /*gateway MAC address*/
++    uint8_t dest_mac[ETH_ALEN] = {0x00, 0x1f, 0x9e, 0x2a, 0x7f, 0xdd};
++
++    tmp_eth_type = htons(eth_type);
++
++    memcpy((void*)(pkt + ETH_DST_ADDR_OFF), (void*)dest_mac, ETH_ALEN);
++    memcpy((void*)(pkt + ETH_SRC_ADDR_OFF), (void*)src_mac, ETH_ALEN);
++    memcpy((void*)(pkt + ETH_TYPE_ADDR_OFF), (void*)&tmp_eth_type, 2);
++}
++
++static void
++write_vlan_hdr (uint8_t *pkt, uint16_t vid, uint16_t pcp, uint16_t id)
++{
++    struct vlan_hdr vlan_h;
++    ovs_be16 vlan_raw;
++    ovs_be16 tpid = htons(id);
++
++    vlan_h.value = ((vid << VLAN_VID_SHIFT) & VLAN_VID_MASK) |
++                   ((pcp << VLAN_PCP_SHIFT) & VLAN_PCP_MASK);
++
++    vlan_raw = htons(vlan_h.value);
++
++    memcpy((void*)pkt, (void *)&tpid, 2);
++    memcpy((void*)(pkt+2), (void *) &vlan_raw, 2);
++}
++
++static void
++write_mpls_hdr (uint8_t *pkt, uint32_t label,
++                uint32_t tc, uint32_t s, uint32_t ttl)
++{
++    struct mpls_hdr mpls_h;
++
++    mpls_h.mpls_lse = htonl(((ttl << MPLS_TTL_SHIFT) &  MPLS_TTL_MASK)  |
++                            ((tc << MPLS_TC_SHIFT) & MPLS_TC_MASK)      |
++                            ((s << MPLS_STACK_SHIFT) & MPLS_STACK_MASK) |
++                            ((label << MPLS_LABEL_SHIFT) & MPLS_LABEL_MASK));
++
++    memcpy((void*)(pkt), (void *) &mpls_h.mpls_lse, 4);
++}
++
++static void
++write_ip_hdr (uint8_t *pkt, uint16_t ip_pkt_len)
++{
++     uint8_t ip_hdr[20] = { 0x45, 0x07, 0x00, 0x00,
++                            0x00, 0x00, 0x00, 0x00,
++                            0x10, 0x11, 0xa3, 0xfc,
++                            0x0a, 0x75, 0x2e, 0xc8,
++                            0x0a, 0x75, 0x2e, 0xc1};
++
++    ip_hdr[2] = (0xFF00 & ip_pkt_len) >> 8;
++    ip_hdr[3] = 0x00FF & ip_pkt_len;
++
++    memcpy((void *)(pkt), (void *) &ip_hdr, 20);
++}
++
++static void
++write_udp_hdr (uint8_t *pkt, uint16_t udp_len)
++{
++    uint8_t udp_hdr[8] = {0x0F, 0x00, 0x0F, 0x00,
++                          0x00, 0x00, 0x00, 0x00};
++    udp_hdr[4] = (0xFF00 & udp_len) >> 8;
++    udp_hdr[5] = (0x00FF & udp_len);
++    memcpy((void *)(pkt), (void *) &udp_hdr, 8);
++}
++
++static void
++write_ip_csum (uint8_t *pkt, uint16_t len)
++{
++    /* len should be just the length of the header */
++    ovs_be16 ip_csum = 0;
++
++    /* initialize the ip checksum field to 0 for
++     * purposes of calculating the header */
++    memcpy(pkt + 10, &ip_csum, 2);
++
++    /* appears to return in network byte order somehow */
++    ip_csum = csum(pkt, len);
++    memcpy(pkt + 10, &ip_csum, 2);
++}
++
++/* argv[1] is the device e.g. eth0
++   argv[2] is the number of pkts to send
++*/
++int
++main (int argc, char **argv)
++{
++
++    int sock_fd;
++    uint8_t pkt[PKT_LENGTH];
++    uint8_t *pkt_pos = pkt;
++    uint8_t *ip_pos;
++    uint32_t label = 100, tc = 4, ttl = 10;
++    uint16_t vid = 101, pcp = 4;
++    uint32_t num_of_pkts, num_labels;
++    uint16_t i = 0;
++    char *str = "FEEDFACE", type[5];
++
++    if (argc != 5) {
++        printf("usage: %s <device> <# pkts> <#labels> <type=vlan/mpls>\n", argv[0]);
++        return -1;
++    }
++
++    num_of_pkts = atoi(argv[2]);
++
++    strncpy(type, argv[argc-1], 5);
++
++    /* Set the magic data 0xfeedface */
++    for (i = 0; i < PKT_LENGTH; i+=8) {
++        memcpy((void*)(pkt + i), (void*)str, 8);
++    }
++
++    num_labels = atoi(argv[3]);
++
++    if (!strcmp(type, "vlan")) {
++        write_ether_hdr(pkt_pos, ETH_TYPE_IP);
++        pkt_pos += ETH_TYPE_ADDR_OFF;
++        for (i = 0; i < num_labels; i++) {
++            if (i == 1 || num_labels == 1) {
++                write_vlan_hdr(pkt_pos, vid++, pcp++, ETH_TYPE_VLAN);
++            }
++            else {
++                write_vlan_hdr(pkt_pos, vid++, pcp++, ETH_TYPE_VLAN);
++            }
++            pkt_pos += 4;
++        }
++        write_ether_type(pkt_pos, ETH_TYPE_IP);
++        pkt_pos+=2;
++    } else {
++        write_ether_hdr(pkt_pos, ETH_TYPE_MPLS);
++        pkt_pos += MPLS_HDR_ADDR_OFF;
++        for (i = 0; i < num_labels; i++) {
++            if (i == num_labels - 1) {
++                write_mpls_hdr(pkt_pos, label++, tc, 1, ttl++);
++            } else {
++                write_mpls_hdr(pkt_pos, label++, tc, 0, ttl++);
++            }
++            pkt_pos += 4;
++        }
++    }
++
++    ip_pos = pkt_pos;
++    write_ip_hdr(pkt_pos, PKT_LENGTH - (ip_pos - pkt));
++    pkt_pos += 20;
++
++    write_udp_hdr(pkt_pos, PKT_LENGTH -(pkt_pos - pkt));
++    pkt_pos += 8;
++
++    write_ip_csum(ip_pos, 20);
++
++    /* Create the socket */
++    sock_fd = create_sock(ETH_P_ALL);
++
++    /* Bind socket to interface */
++    bind_sock(argv[1], sock_fd, ETH_P_ALL);
++
++    while ((num_of_pkts--) > 0) {
++        if (!send_pkt(sock_fd, pkt, PKT_LENGTH)) {
++            perror("Error sending pkt");
++            printf("\n\n");
++            break;
++        }
++    }
++    printf("\nPrinting packet\n");
++    for (i = 0; i < 50; i++)
++        printf("%x ", pkt[i]);
++    if (num_of_pkts == -1)
++        printf("Packets sent successfully\n");
++
++    close(sock_fd);
++    return 0;
++}
+diff --git a/utilities/ovs-dpctl.c b/utilities/ovs-dpctl.c
+index 6cb05b8..1322994 100644
+--- a/utilities/ovs-dpctl.c
++++ b/utilities/ovs-dpctl.c
+@@ -882,17 +882,28 @@ do_normalize_actions(int argc, char *argv[])
+ 
+     hmap_init(&actions_per_flow);
+     NL_ATTR_FOR_EACH (a, left, odp_actions.data, odp_actions.size) {
+-        if (nl_attr_type(a) == OVS_ACTION_ATTR_POP_VLAN) {
++        const struct ovs_action_push_vlan *push;
++        switch(nl_attr_type(a)) {
++        case OVS_ACTION_ATTR_POP_VLAN:
+             flow.vlan_tci = htons(0);
+             continue;
+-        }
+-
+-        if (nl_attr_type(a) == OVS_ACTION_ATTR_PUSH_VLAN) {
+-            const struct ovs_action_push_vlan *push;
+ 
++        case OVS_ACTION_ATTR_PUSH_VLAN:
+             push = nl_attr_get_unspec(a, sizeof *push);
+             flow.vlan_tci = push->vlan_tci;
+             continue;
++
++        case OVS_ACTION_ATTR_PUSH_MPLS:
++            flow.dl_type = nl_attr_get_be16(a);
++            continue;
++
++        case OVS_ACTION_ATTR_POP_MPLS:
++            flow.dl_type = nl_attr_get_be16(a);
++            continue;
++
++        case OVS_ACTION_ATTR_SET_MPLS_LSE:
++            flow.mpls_lse = nl_attr_get_be32(a);
++            continue;
+         }
+ 
+         af = get_actions_for_flow(&actions_per_flow, &flow);
+@@ -923,6 +934,15 @@ do_normalize_actions(int argc, char *argv[])
+             printf("no vlan: ");
+         }
+ 
++        if (af->flow.mpls_lse != htonl(0)) {
++            printf("mpls(label=%"PRIu32",tc=%d,ttl=%d): ",
++                   mpls_lse_to_label(af->flow.mpls_lse),
++                   mpls_lse_to_tc(af->flow.mpls_lse),
++                   mpls_lse_to_ttl(af->flow.mpls_lse));
++        } else {
++            printf("no mpls: ");
++        }
++
+         ds_clear(&s);
+         format_odp_actions(&s, af->actions.data, af->actions.size);
+         puts(ds_cstr(&s));
+diff --git a/utilities/ovs-ofctl.8.in b/utilities/ovs-ofctl.8.in
+index 9c4ea0c..def22e5 100644
+--- a/utilities/ovs-ofctl.8.in
++++ b/utilities/ovs-ofctl.8.in
+@@ -409,6 +409,21 @@ integer between 0 and 65535, inclusive, either in decimal or as a
+ hexadecimal number prefixed by \fB0x\fR (e.g. \fB0x0806\fR to match ARP 
+ packets).
+ .
++.IP \fBmpls_label=\fIlabel\fR
++Matches MPLS Label when \fIethertype\fR is \fI0x8847\fR or \fI0x8848\fR.
++Specify a number between 0 and 2^20-1, inclusive, as the 20-bit MPLS label
++to match. If none specified, all packets which has \fIethertype\fR equal to
++\fI0x8847\fR or \fI0x8848\fR are matched.
++.
++.IP \fBmpls_tc=\fIpriority\fR
++Matches MPLS traffic class when \fIethertype\fR is \fI0x8847\fR or
++\fI0x8848\fR.  Specify a value between 0 and 7, inclusive.  A higher value
++indicates a higher packet priority level.
++.
++.IP \fBmpls_stack=\fIstack\fR
++Matches MPLS stack bit when \fIethertype\fR is \fI0x8847\fR or \fI0x8848\fR.
++Specify either 0 or 1 to match a packet with a single label or multiple labels.
++.
+ .IP \fBnw_src=\fIip\fR[\fB/\fInetmask\fR]
+ .IQ \fBnw_dst=\fIip\fR[\fB/\fInetmask\fR]
+ When \fBdl_type\fR is 0x0800 (possibly via shorthand, e.g. \fBip\fR
+@@ -844,6 +859,36 @@ as necessary to match the value specified.  Valid values are between 0
+ .IP \fBstrip_vlan\fR
+ Strips the VLAN tag from a packet if it is present.
+ .
++.IP \fBpush_mpls\fR:\fIethertype\fR
++Modifies the ethertype of a packet with the value specified. The new MPLS
++label stack entry is set with value copied from outermost MPLS label stack
++entry if present and stack bit set to 0 or MPLS label stack entry is set with
++\fBlabel\fR:\fI0 for IPv4, 2 for IPv6 or default 0\fR, \fBtc\fR:\fIleast
++significant 3 bits from IPv4 DSCP or IPv6 traffic-class or 0\fR,
++\fBstack\fR:\fI1\fR, \fBttl\fR:\fIIPv4 ttl or IPv6 hlim or default 64\fR.
++.
++.IP \fBpop_mpls\fR:\fIethertype\fR
++Strips the outermost MPLS label stack entry and modifies the ethertype of a
++packet with the value specified if MPLS stack bit is set(i.e. bottom of stack).
++.
++.IP \fBset_mpls_label\fR:\fIlabel\fR
++Modifies the outermost MPLS label stack entry's label field.
++.
++.IP \fBset_mpls_ttl\fR:\fIttl\fR
++Modifies the outermost MPLS label stack entry's time-to-live field.
++.
++.IP \fBset_mpls_tc\fR:\fItc\fR
++Modifies the outermost MPLS label stack entry's traffic-class field.
++.
++.IP \fBcopy_mpls_ttl_in\fR
++Copies ttl from outermost MPLS header to next-to-outermost MPLS or IP header.
++.
++.IP \fBcopy_mpls_ttl_out\fR
++Copies ttl from next-to-outermost IP or MPLS header to outermost MPLS header.
++.
++.IP \fBdec_mpls_ttl\fR
++Decrements ttl from outermost MPLS header.
++.
+ .IP \fBmod_dl_src\fB:\fImac\fR
+ Sets the source Ethernet address to \fImac\fR.
+ .
+-- 
+1.7.5.4
+
